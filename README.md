@@ -1,5 +1,5 @@
 # Pattern Analysis
-Pattern Analysis of various datasets by COMP3710 students in 2025 at the University of Queensland.
+Pattern Analysis of various datasets by COMP3710 students in 2026 at the University of Queensland.
 
 We create pattern recognition and image processing library for Tensorflow (TF), PyTorch or JAX.
 

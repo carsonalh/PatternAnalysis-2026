@@ -1,0 +1,7 @@
+[project]
+name = "recognition"
+version = "0.1.0"
+description = "Pattern Analysis 2026 Submission for s4702231"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []

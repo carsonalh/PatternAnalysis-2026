@@ -3,5 +3,11 @@ name = "recognition"
 version = "0.1.0"
 description = "Pattern Analysis 2026 Submission for s4702231"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "torch>=2.14.0",
+]

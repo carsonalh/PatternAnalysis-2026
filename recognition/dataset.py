@@ -54,12 +54,15 @@ class LOBSTERLevel10Dataset(Dataset):
     # Pre-computed from training data set
     LOG_MIDPOINT_MEAN: ClassVar = 14.617649918846451
     LOG_MIDPOINT_STD: ClassVar = 0.005719877315309554
+    LOG_SPREAD_MEAN: ClassVar = 7.124090229537588
+    LOG_SPREAD_STD: ClassVar = 0.4772180337322487
 
     def __init__(self, train: bool = True, normalize: bool = False) -> None:
         books, _messages = load_dfs()
         self.normalize = normalize
         VALIDATION_RATIO = 0.15
         validation_begin = round((1 - VALIDATION_RATIO) * len(books))
+
         if train:
             self.books = books[:validation_begin]
         else:
@@ -73,4 +76,6 @@ class LOBSTERLevel10Dataset(Dataset):
         row = self.books.loc[index]
         midpoint = np.log(0.5 * (row['ASKp1'] + row['BIDp1']))
         midpoint_z = (midpoint - self.LOG_MIDPOINT_MEAN) / self.LOG_MIDPOINT_STD
-        return torch.Tensor([midpoint_z])
+        spread = np.log(row['ASKp1'] - row['BIDp1'])
+        spread_z = (spread - self.LOG_SPREAD_MEAN) / self.LOG_SPREAD_STD
+        return torch.Tensor([midpoint_z, spread_z])

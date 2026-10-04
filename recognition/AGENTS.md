@@ -10,3 +10,9 @@ please make sure to leave concise comments (where necessary) that an
 engineering researcher could understand. It's important that everything in this
 codebase be easy to understand from a human's point of view, so brevity and
 clarity of the code are important where possible.
+
+## Git Flow
+
+The project does not use regular git flow. Making a change in the worktree and
+committing straight to `topic-recognition` is fine, since there is only one
+person working on this branch.

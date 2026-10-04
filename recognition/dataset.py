@@ -1,4 +1,3 @@
-from functools import cache, partial
 from pathlib import Path
 from urllib.request import urlopen
 import pandas as pd
@@ -6,7 +5,7 @@ import logging
 from zipfile import ZipFile
 import torch
 from torch.utils.data import Dataset
-from typing import Callable, ClassVar
+from typing import ClassVar
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -15,11 +14,12 @@ logger = logging.getLogger(__name__)
 _ZIP_URL = "https://php.lobsterdata.com/info/sample/LOBSTER_SampleFile_AMZN_2012-06-21_10.zip"
 _ZIP_FILENAME = "LOBSTER_SampleFile_AMZN_2012-06-21_10.zip" 
 _ORDER_BOOK_LEVELS = 10
+FEATURE_DIMS = 4 * _ORDER_BOOK_LEVELS
 _MESSAGE_BOOK_COLUMN_NAMES = ("time" , "type" , "order_id" , "size" , "price" , "trade_direction")
 
 def download_zip(
     url: str =_ZIP_URL,
-    dir: Path = Path("data/"),
+    dir: Path = Path(__file__).resolve().parent / "data",
     filename =_ZIP_FILENAME,
     cache: bool = True,
 ) -> Path:
@@ -51,31 +51,92 @@ def load_dfs() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 class LOBSTERLevel10Dataset(Dataset):
-    # Pre-computed from training data set
-    LOG_MIDPOINT_MEAN: ClassVar = 14.617649918846451
-    LOG_MIDPOINT_STD: ClassVar = 0.005719877315309554
-    LOG_SPREAD_MEAN: ClassVar = 7.124090229537588
-    LOG_SPREAD_STD: ClassVar = 0.4772180337322487
+    """Event-time book features, optionally standardized using the training split."""
 
-    def __init__(self, train: bool = True, normalize: bool = False) -> None:
+    FEATURE_DIMS: ClassVar = FEATURE_DIMS
+    TICK_SIZE: ClassVar = 100  # One cent in LOBSTER's 1/10000-dollar price units.
+    FEATURE_NAMES: ClassVar = (
+        ("log_midpoint", "log1p_spread")
+        + tuple(f"log1p_ask_gap_{i}" for i in range(2, _ORDER_BOOK_LEVELS + 1))
+        + tuple(f"log1p_bid_gap_{i}" for i in range(2, _ORDER_BOOK_LEVELS + 1))
+        + tuple(f"log1p_ask_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
+        + tuple(f"log1p_bid_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
+    )
+
+    def __init__(self, train: bool = True, normalize: bool = True) -> None:
         books, _messages = load_dfs()
         self.normalize = normalize
         VALIDATION_RATIO = 0.15
         validation_begin = round((1 - VALIDATION_RATIO) * len(books))
 
-        if train:
-            self.books = books[:validation_begin]
-        else:
-            self.books = books[validation_begin:]
+        asks = books[[f"ASKp{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
+        bids = books[[f"BIDp{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
+        ask_sizes = books[[f"ASKs{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
+        bid_sizes = books[[f"BIDs{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
+        midpoints = 0.5 * (asks[:, 0] + bids[:, 0])
+        features = np.column_stack((
+            np.log(midpoints),
+            np.log1p((asks[:, 0] - bids[:, 0]) / self.TICK_SIZE),
+            np.log1p(np.diff(asks, axis=1) / self.TICK_SIZE),
+            np.log1p(-np.diff(bids, axis=1) / self.TICK_SIZE),
+            np.log1p(ask_sizes),
+            np.log1p(bid_sizes),
+        ))
+        self.feature_mean = features[:validation_begin].mean(axis=0)
+        self.feature_std = features[:validation_begin].std(axis=0)
+        self.feature_std[self.feature_std == 0] = 1
+
+        begin, end = (0, validation_begin) if train else (validation_begin, len(books))
+        self.books = books.iloc[begin:end]
+        features = features[begin:end]
+        if self.normalize:
+            features = (features - self.feature_mean) / self.feature_std
+        self.features = torch.from_numpy(features.astype(np.float32))
 
     def __len__(self) -> int:
         return len(self.books)
 
-    @cache
     def __getitem__(self, index: int) -> torch.Tensor:
-        row = self.books.loc[index]
-        midpoint = np.log(0.5 * (row['ASKp1'] + row['BIDp1']))
-        midpoint_z = (midpoint - self.LOG_MIDPOINT_MEAN) / self.LOG_MIDPOINT_STD
-        spread = np.log(row['ASKp1'] - row['BIDp1'])
-        spread_z = (spread - self.LOG_SPREAD_MEAN) / self.LOG_SPREAD_STD
-        return torch.Tensor([midpoint_z, spread_z])
+        return self.features[index]
+
+    def feature_sequence_to_df(
+        self,
+        features: torch.Tensor | np.ndarray,
+    ) -> pd.DataFrame:
+        """Reconstruct a (T, 40) feature array in original LOBSTER units.
+
+        Normalization is undone automatically; each row decodes independently.
+        Prices are rounded to ticks; spread, gaps, and sizes are at least one.
+        The returned DataFrame has a fresh RangeIndex.
+        """
+        if isinstance(features, torch.Tensor):
+            features = features.detach().cpu().numpy()
+        values = np.asarray(features, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != self.FEATURE_DIMS:
+            raise ValueError(f"Expected a (T, {self.FEATURE_DIMS}) feature sequence")
+        if not np.isfinite(values).all():
+            raise ValueError("Features must be finite")
+        if self.normalize:
+            values = values * self.feature_std + self.feature_mean
+
+        with np.errstate(over='raise', invalid='raise'):
+            midpoints = np.exp(values[:, 0])
+            counts = np.maximum(1, np.rint(np.expm1(np.maximum(values[:, 1:], 0))))
+        levels = _ORDER_BOOK_LEVELS
+        spread = counts[:, 0]
+        ask_gaps = counts[:, 1:levels]
+        bid_gaps = counts[:, levels:2 * levels - 1]
+        ask_sizes = counts[:, 2 * levels - 1:3 * levels - 1]
+        bid_sizes = counts[:, 3 * levels - 1:4 * levels - 1]
+        ask_offsets = np.column_stack((np.zeros(len(values)), np.cumsum(ask_gaps, axis=1)))
+        bid_offsets = np.column_stack((np.zeros(len(values)), np.cumsum(bid_gaps, axis=1)))
+        # Round the best bid, then add the integer spread: both quotes stay on
+        # the tick grid even when the implied midpoint is not a half-tick value.
+        best_bid = np.rint(midpoints / self.TICK_SIZE - 0.5 * spread)
+        best_bid = np.maximum(best_bid, bid_offsets[:, -1] + 1)
+        asks = (best_bid[:, None] + spread[:, None] + ask_offsets) * self.TICK_SIZE
+        bids = (best_bid[:, None] - bid_offsets) * self.TICK_SIZE
+        book = np.stack((asks, ask_sizes, bids, bid_sizes), axis=-1).reshape(-1, self.FEATURE_DIMS)
+        if not np.isfinite(book).all() or (book >= 2**63).any():
+            raise ValueError("Decoded book is outside the int64 range")
+        return pd.DataFrame(book.astype(np.int64), columns=self.books.columns)

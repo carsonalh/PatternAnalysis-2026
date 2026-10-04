@@ -1,8 +1,9 @@
 import torch
 from torch import nn
+from dataset import FEATURE_DIMS
 
 class Embedder(nn.Module):
-    def __init__(self, feature_dims: int = 2, latent_dims: int = 128, hidden_dims: int = 256):
+    def __init__(self, feature_dims: int = FEATURE_DIMS, latent_dims: int = 128, hidden_dims: int = 256):
         super().__init__()
         self.input_layer = nn.Linear(feature_dims, latent_dims)
         self.hidden_layers = nn.Sequential(
@@ -14,14 +15,14 @@ class Embedder(nn.Module):
             nn.Linear(hidden_dims, latent_dims),
         )
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, h: torch.Tensor | None = None) -> torch.Tensor:
         x = self.input_layer(x)
-        x += h
+        if h is not None:
+            x = x + h
         x = self.hidden_layers(x)
         return x
 
 
-FEATURE_DIMS = 2
 LATENT_DIMS = 128
 _DECODER_HIDDEN_DIMS = 256
 

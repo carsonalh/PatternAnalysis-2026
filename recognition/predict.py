@@ -1,35 +1,16 @@
 import numpy as np
-import numpy.typing as npt
 import torch
 
 from dataset import features_to_order_book
 from modules import LATENT_DIMS, TimeGAN
 
-def wiener_process_noise(x: npt.NDArray) -> npt.NDArray:
-    """
-    Based off an ndarray of time samples x, compute the wiener process based on
-    the gaps of the last dimension of x.
-    """
-    x = np.asarray(x, dtype=np.float64)
-    if x.ndim < 1 or x.shape[-1] == 0 or not np.isfinite(x).all():
-        raise ValueError("Time samples must be finite and nonempty")
-    z0 = np.zeros(shape=(*x.shape[:-1], 1))
-    diffs = x[..., 1:] - x[..., :x.shape[-1] - 1]
-    if (diffs < 0).any():
-        raise ValueError("Time samples must be nondecreasing")
-    z = np.random.normal(size=(*x.shape[:-1], x.shape[-1] - 1))
-    # A Wiener increment has variance dt, so its standard deviation is sqrt(dt).
-    z = np.concatenate((z0, np.sqrt(diffs) * z), axis=-1)
-    z = np.cumsum(z, axis=-1)
-    return z
 
-
-def draw_noise(
+def generate_wiener_paths(
     batch_size: int, sequence_length: int = 64, noise_dims: int = LATENT_DIMS,
     *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32,
     rng: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent Wiener paths (B, T, Z) and Gaussian initial seeds (B, Z).
+    """Generate multidimensional Wiener paths (B, T, Z) and Gaussian seeds (B, Z).
 
     The grid spans [0, 1] in event order; it does not model elapsed clock time.
     """
@@ -48,8 +29,9 @@ def draw_noise(
 def generate_features(model: TimeGAN, batch_size: int, sequence_length: int = 64) -> torch.Tensor:
     """Generate standardized features without real books or the embedder."""
     parameter = next(model.generator.parameters())
-    paths, seed = draw_noise(batch_size, sequence_length, model.generator.noise_dims,
-                             device=parameter.device, dtype=parameter.dtype)
+    paths, seed = generate_wiener_paths(
+        batch_size, sequence_length, model.generator.noise_dims,
+        device=parameter.device, dtype=parameter.dtype)
     return model.decoder(model.generator.sample(paths, seed))
 
 

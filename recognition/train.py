@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from dataset import LOBSTERLevel10Dataset, WindowDataset
 from modules import TimeGAN
-from predict import draw_noise
+from predict import generate_wiener_paths
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +76,9 @@ class TimeGANTrainer:
         optimizer.step()
 
     def _noise(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return draw_noise(x.shape[0], x.shape[1], self.model.generator.noise_dims,
-                          device=x.device, dtype=x.dtype)
+        return generate_wiener_paths(
+            x.shape[0], x.shape[1], self.model.generator.noise_dims,
+            device=x.device, dtype=x.dtype)
 
     def autoencoder_step(self, x: torch.Tensor) -> dict[str, float]:
         self.train_only(self.model.embedder, self.model.decoder)

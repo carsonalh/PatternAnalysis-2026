@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from dataset import LOBSTERLevel10Dataset, ORDER_BOOK_COLUMNS, WindowDataset, features_to_order_book
 from evaluation import compare_sequences, evaluate_timegan, next_step_mae, sequence_statistics
 from modules import TimeGAN
-from predict import draw_noise, generate_features, load_checkpoint, wiener_process_noise
+from predict import generate_wiener_paths, generate_features, load_checkpoint
 from train import TimeGANTrainer, TrainingConfig, save_checkpoint, supervised_loss
 
 # Small recurrent tests are substantially faster without many CPU worker threads.
@@ -78,7 +78,7 @@ class DatasetTests(unittest.TestCase):
 class NoiseTests(unittest.TestCase):
     def test_wiener_variance_and_independent_channels(self):
         rng = torch.Generator().manual_seed(7)
-        paths, seed = draw_noise(12_000, 9, 4, rng=rng)
+        paths, seed = generate_wiener_paths(12_000, 9, 4, rng=rng)
         self.assertEqual(paths.shape, (12_000, 9, 4))
         self.assertEqual(seed.shape, (12_000, 4))
         self.assertTrue(torch.equal(paths[:, 0], torch.zeros_like(paths[:, 0])))
@@ -89,22 +89,13 @@ class NoiseTests(unittest.TestCase):
         correlations = torch.corrcoef(increments.flatten(0, 1).T)
         self.assertLess((correlations - torch.eye(4)).abs().max().item(), 0.025)
 
-    def test_numpy_helper_uses_sqrt_dt_on_irregular_grid(self):
-        np.random.seed(7)
-        grid = np.broadcast_to([0, 0.04, 0.25, 1.0], (20_000, 4))
-        paths = wiener_process_noise(grid)
-        np.testing.assert_allclose(np.diff(paths, axis=-1).var(axis=0), [0.04, 0.21, 0.75], rtol=0.04)
-        np.testing.assert_array_equal(wiener_process_noise(np.array([0, 0])), [0, 0])
-        with self.assertRaises(ValueError):
-            wiener_process_noise(np.array([1, 0]))
-
 
 class ModelTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(11)
         self.model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
         self.x = torch.randn(4, 6, 3)
-        self.noise, self.seed = draw_noise(4, 6, 7)
+        self.noise, self.seed = generate_wiener_paths(4, 6, 7)
 
     def test_shapes_teacher_alignment_and_random_first_books(self):
         h = self.model.embedder(self.x)
@@ -188,7 +179,7 @@ class TrainingTests(unittest.TestCase):
 
     def test_supervision_differentiates_through_frozen_generator(self):
         self.trainer.train_only(self.model.embedder, self.model.decoder)
-        noise, _ = draw_noise(4, 6, 7)
+        noise, _ = generate_wiener_paths(4, 6, 7)
         h = self.model.embedder(self.x)
         supervised_loss(self.model.generator, h, noise).backward()
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0
@@ -236,7 +227,7 @@ class TrainingTests(unittest.TestCase):
             trainer.autoencoder_step(training[torch.randint(128, (32,))])
         with torch.no_grad():
             h = model.embedder(validation)
-            noise, _ = draw_noise(32, 10, 4)
+            noise, _ = generate_wiener_paths(32, 10, 4)
             transition_before = supervised_loss(model.generator, h, noise).item()
             reconstruction_after = F.mse_loss(model(validation), validation).item()
         for _ in range(150):

@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 from dataset import LOBSTERLevel10Dataset, WindowDataset
 from modules import TimeGAN
-from predict import draw_noise, generate_features
+from predict import generate_wiener_paths, generate_features
 
 
 def _correlation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -114,7 +114,7 @@ def _validation_losses(model: TimeGAN, real: torch.Tensor) -> dict[str, float]:
     device = next(model.parameters()).device
     x = real.to(device)
     latents = model.embedder(x)
-    noise, _ = draw_noise(len(x), x.shape[1], model.generator.noise_dims, device=device)
+    noise, _ = generate_wiener_paths(len(x), x.shape[1], model.generator.noise_dims, device=device)
     return {
         "reconstruction_mse": F.mse_loss(model.decoder(latents), x).item(),
         "transition_mse": F.mse_loss(model.generator.teacher_forced(latents, noise), latents[:, 1:]).item(),

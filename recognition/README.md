@@ -69,6 +69,10 @@ uv run python main.py --autoencoder-steps 10 --transition-steps 10 --joint-steps
 
 Step budgets, loss weights, learning rate, batch size, sequence length, noise
 dimension, and latent dimension are configurable; see `python main.py --help`.
+`--discriminator-learning-rate` overrides only the discriminator's rate;
+otherwise all networks use `--learning-rate`. `--generator-updates` controls
+the number of generator updates per joint iteration (default 1). Each takes
+fresh noise; logged generator losses are averaged across those updates.
 The default output directory is `runs/timegan/`:
 
 - `model.pt`: all network weights, model configuration, and training normalization.
@@ -138,3 +142,50 @@ the training split. It uses saved generated windows (or samples the checkpoint)
 and computes returns within sequences after tick-rounded book conversion.
 It prints `KL(training || TimeGAN)` in nats using the same shared-bin, smoothed
 histogram distributions shown in the midpoint plots.
+
+`training_balance_experiment.py` runs controlled tests of the initial midpoint
+jump with a fresh baseline, discriminator rates `1e-4` and `3e-5`, or two
+generator updates per discriminator update. Run each named setting with:
+
+```sh
+uv run python training_balance_experiment.py baseline
+uv run python training_balance_experiment.py discriminator_1e-4
+uv run python training_balance_experiment.py discriminator_3e-5
+uv run python training_balance_experiment.py generator_twice
+```
+
+All settings use seed 0, identical model sizes and stage budgets, and a separate
+sampler RNG to preserve real-batch order. The two-update setting takes twice as
+many joint generator updates. Results under `runs/training_balance/` include
+checkpoints, losses, diagnostics at 1,000/2,500/5,000 joint iterations, eight
+forecast contexts with 32 completions each, and full-validation continuations.
+The report notebook `notebooks/lobster_timegan_training_balance.ipynb` shows
+the initial 128 events alongside each full-day completion chart.
+
+The optional `--context-loss-weight` adds decoded midpoint supervision to the
+generator's joint loss; its default of 0 preserves the original objective.
+With `--context-horizon 16`, the first 48 events of each training window form
+a real context. The generator then predicts the last 16 events with its own
+latent feedback and a Wiener path restarted at zero, preserving training
+increment variance. Only the generator is updated by this term; the frozen
+decoder transmits gradients to it. The loss is MSE on standardized log midpoint
+(feature zero), before tick rounding. It specifically addresses price drift,
+rather than supervising every book feature.
+
+Run the controlled comparison at loss weights 10 and 100 with:
+
+```sh
+uv run python context_loss_experiment.py --weight 10
+uv run python context_loss_experiment.py --weight 100
+```
+
+The reference is the previous `discriminator_1e-4` run. Both new runs retain
+its architecture, learning rates, noise, real-batch order, and 1,000/1,000/5,000
+stage budgets. They reuse the generator update's Wiener path, so enabling the
+loss does not consume additional random draws. Each fits only training data;
+validation is used for diagnostics. `notebooks/lobster_timegan_context_loss.ipynb`
+compares midpoint completions, early drift, noise sensitivity, and ordinary
+generated-window statistics. A squared error against one observed future may
+favor smoother prices; this is an experiment in correcting the hand-off, not
+evidence of calibrated conditional uncertainty. Long rollouts still exceed
+the supervised 16-event horizon.

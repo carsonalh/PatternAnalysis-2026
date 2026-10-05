@@ -187,6 +187,10 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     elapsed = time.monotonic() - started
     save_checkpoint(directory / "model.pt", model, config, training)
     pd.DataFrame(history).to_csv(directory / "losses.csv", index=False)
+    measured, curves, contexts = diagnostics(model, training, validation, config)
+    (directory / "diagnostics_final.json").write_text(
+        json.dumps({"metrics": measured, "curves": curves}, indent=2, allow_nan=False) + "\n")
+    contexts.to_csv(directory / "contexts_final.csv", index=False)
     metadata = {
         "experiment": experiment, "seed": seed, "threads": threads,
         "training_config": asdict(config), "model_config": model.model_config,

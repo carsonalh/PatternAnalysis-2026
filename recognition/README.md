@@ -131,3 +131,10 @@ sensitivity; variance scales with the square of amplitude. Full-validation
 rollouts retain the training variance per event and extend beyond the trained
 window length. The notebook also compares price-change statistics and the
 spread between completion endpoints.
+
+`notebooks/lobster_timegan_return_distributions.ipynb` compares midpoint log
+returns and event-to-event log changes in each adjacent ask/bid price gap with
+the training split. It uses saved generated windows (or samples the checkpoint)
+and computes returns within sequences after tick-rounded book conversion.
+It prints `KL(training || TimeGAN)` in nats using the same shared-bin, smoothed
+histogram distributions shown in the midpoint plots.

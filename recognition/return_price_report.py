@@ -1,4 +1,4 @@
-"""Build paired price-level, noise-reset, return, and innovation diagnostics.
+"""Build paired price-level, noise-reset, and decoder-return diagnostics.
 
 Only the noise clock changes in the reset control; the original model weights
 and real starting context are retained. Return-model forecasts use generated
@@ -22,18 +22,6 @@ import training_balance_experiment as experiment
 def main():
     project_dir = Path(__file__).resolve().parent
     root = project_dir / "runs/return_price"
-    # Upgrade the already fitted head to the unified, automatically selected model.
-    head_dir = root / "innovation_head_seed_0"
-    payload = torch.load(head_dir / "model.pt", weights_only=True)
-    if "price_calibration" not in payload:
-        head = torch.load(head_dir / "price_head.pt", weights_only=True)
-        payload["model_config"]["price_dynamics"] = "innovation_head"
-        payload["model_state"].update({
-            "price_volatility." + name: value for name, value in head["state_dict"].items()
-        })
-        payload["price_calibration"] = head["calibration"]
-        torch.save(payload, head_dir / "model.pt")
-
     original = project_dir / "runs/context_loss/context_weight_100_horizon_16_seed_0"
     for name in ("previous_levels", "reset_noise"):
         directory = root / f"{name}_seed_0"
@@ -54,7 +42,7 @@ def main():
     def reset_complete(model, contexts, paths):
         return original_complete(model, contexts, reset_clock(paths))
 
-    names = ["innovation_head", "previous_levels", "reset_noise",
+    names = ["previous_levels", "reset_noise",
              "returns_context_1_moments_10", "returns_context_10_moments_10"]
     torch.set_num_threads(1)
     for name in names:

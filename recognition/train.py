@@ -264,8 +264,6 @@ def save_checkpoint(path: Path, model: TimeGAN, config: TrainingConfig,
         "price_representation": data.price_representation,
         "reference_midpoint": data.reference_midpoint,
     }
-    if hasattr(model, "price_calibration"):
-        checkpoint["price_calibration"] = model.price_calibration
     torch.save(checkpoint, path)
 
 

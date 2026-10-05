@@ -17,7 +17,6 @@ from modules import TimeGAN
 from predict import generate_wiener_paths, generate_features, load_checkpoint
 from train import TimeGANTrainer, TrainingConfig, context_price_loss, save_checkpoint, supervised_loss
 from training_balance_experiment import complete, noise_paths
-from price_dynamics import PriceVolatility, price_innovations
 
 # Small recurrent tests are substantially faster without many CPU worker threads.
 torch.set_num_threads(1)
@@ -304,40 +303,52 @@ class TrainingTests(unittest.TestCase):
         changed[:, 3:] += 100
         torch.testing.assert_close(future[:, :2], complete(model, contexts, changed)[:, :2])
 
-    def test_innovation_prices_cannot_inherit_decoder_midpoint_bias(self):
-        model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7, price_dynamics="innovation_head")
+    def test_midpoint_returns_follow_decoder_in_sampling_and_completion(self):
+        model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
         model.price_representation, model.noise_kind, model.context_horizon = "return", "wiener_increments", 2
-        model.price_calibration = {"return_mean": 0.0, "return_std": 1e-5,
-                                   "log_expected_price_factor": 0.0, "sequence_length": 6}
+        model.sequence_length = 6
         contexts = torch.randn(4, 6, 3)
         paths = noise_paths(4, 9, model, 6)
-        original = complete(model, contexts, paths)
-        with torch.no_grad():
-            model.decoder[-1].bias[0].add_(1000)
-        torch.testing.assert_close(original, complete(model, contexts, paths))
-
-    def test_price_innovations_have_the_calibrated_arithmetic_drift(self):
-        head = PriceVolatility(8)
-        with torch.no_grad():
-            for parameter in head.parameters():
-                parameter.zero_()
-            head[-2].bias.fill_(np.log(np.expm1(0.5)))
-        calibration = {"return_mean": 0.0, "return_std": 0.4,
-                       "log_expected_price_factor": float(np.log1p(0.0002)), "sequence_length": 64}
         torch.manual_seed(7)
-        inputs = torch.randn(100_000) / 63 ** 0.5
-        returns = price_innovations(head, torch.zeros(100_000, 8), inputs, calibration)
-        self.assertAlmostEqual((returns * 0.4).exp().mean().item(), 1.0002, delta=0.003)
+        original_samples = generate_features(model, 4, 6)
+        original_continuation = complete(model, contexts, paths)
+        with torch.no_grad():
+            model.decoder[-1].bias[0].add_(0.25)
+        torch.manual_seed(7)
+        changed_samples = generate_features(model, 4, 6)
+        changed_continuation = complete(model, contexts, paths)
+        # Sampling latents are unchanged; conditional history changes after event 1.
+        torch.testing.assert_close(changed_samples[..., 0], original_samples[..., 0] + 0.25)
+        torch.testing.assert_close(changed_samples[..., 1:], original_samples[..., 1:])
+        torch.testing.assert_close(changed_continuation[:, 0, 0], original_continuation[:, 0, 0] + 0.25)
 
-    def test_return_innovation_checkpoint_round_trip(self):
+    def test_rejects_checkpoints_that_replace_the_decoder_midpoint(self):
+        with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
+            data = LOBSTERLevel10Dataset(price_representation="return")
+        model = TimeGAN(latent_dims=8, noise_dims=7)
+        config = TrainingConfig(price_representation="return", noise_kind="wiener_increments")
+        with tempfile.TemporaryDirectory() as directory:
+            original_path, altered_path = Path(directory) / "original.pt", Path(directory) / "altered.pt"
+            save_checkpoint(original_path, model, config, data)
+            for marker in ("model_config", "calibration", "weights"):
+                with self.subTest(marker=marker):
+                    payload = torch.load(original_path, weights_only=True)
+                    if marker == "model_config":
+                        payload["model_config"]["price_dynamics"] = "innovation_head"
+                    elif marker == "calibration":
+                        payload["price_calibration"] = {}
+                    else:
+                        payload["model_state"]["price_volatility.0.weight"] = torch.zeros(1)
+                    torch.save(payload, altered_path)
+                    with self.assertRaisesRegex(ValueError, "decoder's midpoint"):
+                        load_checkpoint(altered_path)
+
+    def test_return_decoder_checkpoint_round_trip(self):
         with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
             data = LOBSTERLevel10Dataset(price_representation="return")
         config = TrainingConfig(price_representation="return", noise_kind="wiener_increments")
-        model = TimeGAN(latent_dims=8, noise_dims=7, price_dynamics="innovation_head")
-        model.price_calibration = {"return_mean": float(data.feature_mean[0]),
-                                   "return_std": float(data.feature_std[0]),
-                                   "log_expected_price_factor": 0.0, "sequence_length": 64}
-        trainer = TimeGANTrainer(model, config)
+        model = TimeGAN(latent_dims=8, noise_dims=7)
+        TimeGANTrainer(model, config)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
             save_checkpoint(path, model, config, data)

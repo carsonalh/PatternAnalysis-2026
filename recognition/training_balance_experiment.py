@@ -53,10 +53,6 @@ def noise_paths(batch, horizon, model, sequence_length):
 @torch.inference_mode()
 def complete(model, contexts, paths, chunk_size=1024):
     """Continue an observed prefix using only generated history thereafter."""
-    if hasattr(model, "price_volatility"):
-        from price_dynamics import innovation_completion
-        return innovation_completion(model, model.price_volatility, contexts, paths,
-                                      model.price_calibration)
     if getattr(model, "price_representation", "level") == "return":
         # Repeat the trained conditional task using only generated history.
         # No validation observations or price offsets are inserted mid-forecast.

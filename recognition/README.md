@@ -111,7 +111,7 @@ standardized feature units. Defaults use up to 256 windows per split and 200
 predictor updates. These are small feasibility checks, not evidence of
 out-of-day generalization or guaranteed generation quality.
 
-## Checks and notebooks
+## Checks
 
 ```sh
 uv run python -m unittest discover -s tests -v
@@ -122,105 +122,67 @@ channel independence, causality, state resets, teacher-forcing alignment,
 gradient flow and optimizer ownership, checkpoint sampling, and learning
 transitions on synthetic autoregressive sequences.
 
-`notebooks/lobster_autoencoder.ipynb` now trains on nonoverlapping recurrent
-windows and compares reconstructed books. Instantiate recovery with
-`Decoder()`; the embedder now requires `(batch, time, features)` inputs rather
-than independent snapshots. `notebooks/wiener_process.ipynb` demonstrates the
-correct square-root scaling of Wiener increments.
+## Notebook reading order
 
-`notebooks/lobster_timegan_noise_ablation.ipynb` compares three paired midpoint
-continuations at Wiener amplitudes 1, 0.5, 0.25, and 0, with a separate chart
-for each case. It reuses one saved checkpoint to isolate inference-time noise
-sensitivity; variance scales with the square of amplitude. Full-validation
-rollouts retain the training variance per event and extend beyond the trained
-window length. The notebook also compares price-change statistics and the
-spread between completion endpoints.
+The four notebooks form one feasibility review. They have executed plots and
+tables and can also be run independently from the project or notebook directory.
+The [notebook guide](notebooks/README.md) lists required artifacts and reproduction
+commands. Training is opt-in; existing experimental outputs remain in `runs/`.
 
-`notebooks/lobster_timegan_return_distributions.ipynb` compares midpoint log
-returns and event-to-event log changes in each adjacent ask/bid price gap with
-the training split. It uses saved generated windows (or samples the checkpoint)
-and computes returns within sequences after tick-rounded book conversion.
-It prints `KL(training || TimeGAN)` in nats using the same shared-bin, smoothed
-histogram distributions shown in the midpoint plots.
+1. [AMZN data and features](notebooks/order_book_analysis.ipynb): the trading day,
+   spread and gap structure, opening outliers, training-only normalization, and
+   conversion checks for price-level and return features.
+2. [Baseline TimeGAN](notebooks/lobster_timegan.ipynb): architecture, stage losses,
+   current-model reconstruction checks, and an exploratory completion overview.
+3. [Price dynamics experiments](notebooks/lobster_timegan_return_dynamics.ipynb):
+   paired inference-noise ablation, training balance, context loss, and
+   decoder-generated returns, with successful and unsuccessful controls
+   in shared comparisons.
+4. [Generation evaluation](notebooks/lobster_timegan_return_distributions.ipynb):
+   price-level versus return TimeGAN midpoint and gap returns, histogram KL, spread/depth,
+   temporal and joint structure, and a common-feature prediction check.
 
-`training_balance_experiment.py` runs controlled tests of the initial midpoint
-jump with a fresh baseline, discriminator rates `1e-4` and `3e-5`, or two
-generator updates per discriminator update. Run each named setting with:
+The earlier statistics, preprocessing, autoencoder, and Wiener demonstrations
+are incorporated into these chapters. Separate noise, balance, and context-loss
+notebooks are consolidated into chapter 3. The unrelated MNIST and volatility
+learning exercises are removed; their prior versions remain in Git history.
 
-```sh
-uv run python training_balance_experiment.py baseline
-uv run python training_balance_experiment.py discriminator_1e-4
-uv run python training_balance_experiment.py discriminator_3e-5
-uv run python training_balance_experiment.py generator_twice
-```
-
-All settings use seed 0, identical model sizes and stage budgets, and a separate
-sampler RNG to preserve real-batch order. The two-update setting takes twice as
-many joint generator updates. Results under `runs/training_balance/` include
-checkpoints, losses, diagnostics at 1,000/2,500/5,000 joint iterations, eight
-forecast contexts with 32 completions each, and full-validation continuations.
-The report notebook `notebooks/lobster_timegan_training_balance.ipynb` shows
-the initial 128 events alongside each full-day completion chart.
+## Price dynamics variants
 
 The optional `--context-loss-weight` adds decoded midpoint supervision to the
-generator's joint loss; its default of 0 preserves the original objective.
-With `--context-horizon 16`, the first 48 events of each training window form
-a real context. The generator then predicts the last 16 events with its own
-latent feedback and a Wiener path restarted at zero, preserving training
-increment variance. Only the generator is updated by this term; the frozen
-decoder transmits gradients to it. The loss is MSE on standardized log midpoint
-(feature zero), before tick rounding. It specifically addresses price drift,
-rather than supervising every book feature.
+joint generator objective. Its default of 0 preserves the baseline. With
+`--context-horizon 16`, a 48-event real prefix conditions 16 generated events.
+Only the generator is updated by this term; gradients pass through the frozen
+decoder. This improves the handoff in the measured runs but does not establish
+realistic longer continuations or calibrated uncertainty.
 
-Run the controlled comparison at loss weights 10 and 100 with:
+The return variant replaces only log midpoint with its event-to-event log
+return and uses stationary Wiener increments. The other 39 features remain
+unchanged. Prices integrate from the starting midpoint. The return experiments
+also change context supervision and add return moment matching, so their
+comparison with the baseline does not isolate representation alone.
 
-```sh
-uv run python context_loss_experiment.py --weight 10
-uv run python context_loss_experiment.py --weight 100
-```
+All generated features, including midpoint returns, come from the TimeGAN
+**decoder**. The return checkpoint emits a standardized log return as feature
+zero. Reverse training normalization and accumulate these returns from a
+starting midpoint to recover prices. No separate price model replaces this
+output and no expected drift is imposed at inference. A learned return bias
+can still accumulate and must be reported as a generation error.
 
-The reference is the previous `discriminator_1e-4` run. Both new runs retain
-its architecture, learning rates, noise, real-batch order, and 1,000/1,000/5,000
-stage budgets. They reuse the generator update's Wiener path, so enabling the
-loss does not consume additional random draws. Each fits only training data;
-validation is used for diagnostics. `notebooks/lobster_timegan_context_loss.ipynb`
-compares midpoint completions, early drift, noise sensitivity, and ordinary
-generated-window statistics. A squared error against one observed future may
-favor smoother prices; this is an experiment in correcting the hand-off, not
-evidence of calibrated conditional uncertainty. Long rollouts still exceed
-the supervised 16-event horizon.
-
-`notebooks/lobster_timegan_return_dynamics.ipynb` investigates the remaining
-price reset with price-level, noise-reset, return, and calibrated-innovation
-forecasts. Return features replace log midpoint with its event-to-event log
-change; all normalization still uses training events. Their prices are
-integrated from the last observed midpoint. Return models use Wiener increments
-as stationary inputs and repeat the trained 48-context/16-future task, using
-only generated history after the starting prefix.
-
-Learning returns can leave a small bias that accumulates. The recommended
-**hybrid price model** uses a separate neural volatility head, fitted by Gaussian
-negative log likelihood on real training prefixes and their 16-event futures.
-Expected arithmetic-price drift is fixed to the empirical training drift.
-The lognormal correction preserves that expectation when volatility varies.
-TimeGAN generates the book structure; this head generates midpoint innovations.
-It therefore removes decoder attraction to an absolute price level, with an
-explicit restriction on directional forecasts. Volatility and joint book
-dynamics still need validation.
-
-To reproduce the comparison (the previous context-weight-100 run is the
-price-level reference):
+The current return example uses
+`runs/return_price/returns_context_1_moments_10_seed_0/model.pt`:
 
 ```sh
-uv run python return_price_experiment.py --weight 1
-uv run python return_price_experiment.py --weight 10
-uv run python calibrate_price_dynamics.py runs/return_price/returns_context_1_moments_10_seed_0/model.pt
-uv run python return_price_report.py
+uv run python predict.py runs/return_price/returns_context_1_moments_10_seed_0/model.pt --samples 16 --output runs/return_samples
 ```
 
-The unified `runs/return_price/innovation_head_seed_0/model.pt` checkpoint saves
-the volatility head and drift calibration. `load_checkpoint` selects that head
-automatically for `generate_features` and the experiment's `complete` function.
-Standalone return windows use the saved training median as their price anchor;
-conditional continuations use the actual last observed midpoint. Existing
-price-level checkpoints retain their original sampling behavior.
+Standalone return windows each use the saved training median as their price
+anchor; conditional continuations use the last observed midpoint. Return
+accumulation resets between independent windows. The price-level baseline
+remains a control. Checkpoints from the removed external-price experiment
+are rejected rather than silently replacing the decoder midpoint output.
+
+These are one-day, one-training-seed development comparisons. Validation has
+been repeatedly inspected while selecting interventions, so it is not an
+untouched final test set. A corrected price reset alone is not evidence of
+realistic full-book generation or out-of-day generalization.

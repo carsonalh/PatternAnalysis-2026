@@ -229,16 +229,18 @@ def main():
     if not args.skip_evaluation:
         validation_data = LOBSTERLevel10Dataset(train=False)
         report, generated = evaluate_timegan(model, train_data, validation_data,
-                                             config.sequence_length, args.evaluation_samples,
-                                             args.predictor_steps, args.seed)
-        (args.output / "evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+                                             sequence_length=config.sequence_length,
+                                             samples=args.evaluation_samples,
+                                             predictor_steps=args.predictor_steps, seed=args.seed)
+        (args.output / "evaluation.json").write_text(
+            json.dumps(asdict(report), default=torch.Tensor.tolist, indent=2, allow_nan=False) + "\n")
         np.save(args.output / "generated_features.npy", generated.numpy())
         train_data.feature_sequence_to_df(generated[0]).to_csv(
             args.output / "sample_order_book.csv", index=False)
-        scores = report["predictive_mae_standardized"]
+        scores = report.predictive_mae_standardized
         logger.info("Held-out reconstruction MSE=%.5f; predictive MAE: real=%.5f, synthetic=%.5f",
-                    report["validation_losses"]["reconstruction_mse"],
-                    scores["train_real_test_real"], scores["train_synthetic_test_real"])
+                    report.validation_losses.reconstruction_mse,
+                    scores.train_real_test_real, scores.train_synthetic_test_real)
     logger.info("Saved model and results to %s", args.output)
 
 

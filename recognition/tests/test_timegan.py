@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from dataset import LOBSTERLevel10Dataset, ORDER_BOOK_COLUMNS, WindowDataset, features_to_order_book
-from evaluation import compare_sequences, evaluate_timegan, next_step_mae, sequence_statistics
+from evaluation import book_statistics, compare_sequences, evaluate_timegan, next_step_mae, sequence_statistics
 from modules import TimeGAN
 from predict import generate_wiener_paths, generate_features, load_checkpoint
 from train import TimeGANTrainer, TrainingConfig, save_checkpoint, supervised_loss
@@ -249,23 +250,36 @@ class EvaluationTests(unittest.TestCase):
         report, generated = evaluate_timegan(model, training, validation,
                                              sequence_length=4, samples=4, predictor_steps=3)
         self.assertEqual(generated.shape, (4, 4, 40))
-        self.assertEqual(report["validation_windows"], 3)
-        self.assertIn("unprojected_feature_statistics", report)
-        self.assertIn("projected_book_statistics", report)
-        json.dumps(report, allow_nan=False)
+        self.assertEqual(report.validation_windows, 3)
+        self.assertEqual(report.unprojected_feature_statistics.real.mean.shape, (40,))
+        self.assertGreater(report.projected_book_statistics.generated.spread_mean_dollars, 0)
+        saved = json.loads(json.dumps(asdict(report), default=torch.Tensor.tolist, allow_nan=False))
+        self.assertEqual(len(saved["unprojected_feature_statistics"]["real"]["mean"]), 40)
+        self.assertIsInstance(saved["unprojected_feature_statistics"]["absolute_errors"]["mean"], float)
 
     def test_statistics_do_not_cross_window_boundaries(self):
         windows = torch.tensor([[[0.0], [1.0]], [[100.0], [101.0]]])
         stats = sequence_statistics(windows)
-        self.assertEqual(stats["change_mean"].item(), 1)
-        self.assertEqual(stats["change_std"].item(), 0)
+        self.assertEqual(stats.change_mean.item(), 1)
+        self.assertEqual(stats.change_std.item(), 0)
         comparison = compare_sequences(windows, windows)
-        self.assertTrue(all(value == 0 for value in comparison["absolute_errors"].values()))
+        for value in asdict(comparison.absolute_errors).values():
+            self.assertEqual(value.item(), 0)
+
+    def test_book_statistics_use_dollars_and_total_depth(self):
+        books = torch.from_numpy(make_books(events=4).to_numpy(copy=True)).unsqueeze(0)
+        stats = book_statistics(books)
+        self.assertAlmostEqual(stats.spread_mean_dollars, 0.01)
+        self.assertEqual(stats.ask_depth_mean_shares, 160)
+        self.assertEqual(stats.bid_depth_mean_shares, 275)
+        self.assertAlmostEqual(stats.midpoint_change_mean_dollars, 0.01)
 
     def test_predictive_evaluation_is_reproducible_and_finite(self):
         torch.manual_seed(15)
         windows = torch.randn(8, 4, 2)
+        rng_before = torch.get_rng_state()
         first = next_step_mae(windows, windows, steps=3, seed=2)
+        self.assertTrue(torch.equal(torch.get_rng_state(), rng_before))
         second = next_step_mae(windows, windows, steps=3, seed=2)
         self.assertEqual(first, second)
         self.assertTrue(np.isfinite(first))

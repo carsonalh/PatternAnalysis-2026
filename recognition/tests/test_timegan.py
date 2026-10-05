@@ -16,6 +16,8 @@ from evaluation import book_statistics, compare_sequences, evaluate_timegan, nex
 from modules import TimeGAN
 from predict import generate_wiener_paths, generate_features, load_checkpoint
 from train import TimeGANTrainer, TrainingConfig, context_price_loss, save_checkpoint, supervised_loss
+from training_balance_experiment import complete, noise_paths
+from price_dynamics import PriceVolatility, price_innovations
 
 # Small recurrent tests are substantially faster without many CPU worker threads.
 torch.set_num_threads(1)
@@ -33,6 +35,31 @@ def make_books(events=100):
 
 
 class DatasetTests(unittest.TestCase):
+    def test_returns_round_trip_with_past_only_boundary_and_training_scaling(self):
+        books = make_books()
+        with patch("dataset.load_dfs", return_value=(books, pd.DataFrame())):
+            training = LOBSTERLevel10Dataset(True, price_representation="return")
+            validation = LOBSTERLevel10Dataset(False, price_representation="return")
+        prices = (books.ASKp1 + books.BIDp1).to_numpy() / 2
+        returns = np.r_[0, np.diff(np.log(prices))]
+        self.assertEqual(training.feature_names[0], "log_midpoint_return")
+        self.assertAlmostEqual(training.feature_mean[0], returns[:85].mean())
+        np.testing.assert_array_equal(training.feature_mean, validation.feature_mean)
+        decoded = validation.feature_sequence_to_df(validation.features, initial_midpoint=prices[84])
+        np.testing.assert_array_equal(decoded.to_numpy(), books.iloc[85:].to_numpy())
+        np.testing.assert_array_equal(
+            training.feature_sequence_to_df(training.features[10:20], initial_midpoint=prices[9]).to_numpy(),
+            books.iloc[10:20].to_numpy())
+
+    def test_return_export_requires_an_explicit_positive_anchor(self):
+        features = np.zeros((3, 40))
+        for anchor in (None, 0, -1, float("nan")):
+            with self.subTest(anchor=anchor), self.assertRaises(ValueError):
+                features_to_order_book(features, price_representation="return", initial_midpoint=anchor)
+        # Zero returns preserve the anchor exactly when the spread is even.
+        features[:, 1] = np.log1p(2)
+        books = features_to_order_book(features, price_representation="return", initial_midpoint=2_200_000)
+        np.testing.assert_array_equal((books.ASKp1 + books.BIDp1) / 2, np.full(3, 2_200_000))
     def test_windows_preserve_split_and_training_normalization(self):
         books = make_books()
         with patch("dataset.load_dfs", return_value=(books, pd.DataFrame())):
@@ -223,6 +250,104 @@ class TrainingTests(unittest.TestCase):
         for horizon in (0, -1, 1.5, 64):
             with self.subTest(horizon=horizon), self.assertRaises(ValueError):
                 TrainingConfig(context_loss_weight=1, context_horizon=horizon)
+        for option in ({"noise_kind": "invalid"}, {"price_representation": "invalid"},
+                       {"price_moment_weight": -1}, {"price_moment_weight": float("nan")}):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                TrainingConfig(**option)
+
+    def test_increment_inputs_keep_variance_constant_over_long_horizons(self):
+        config = TrainingConfig(sequence_length=6, noise_kind="wiener_increments")
+        trainer = TimeGANTrainer(self.model, config)
+        torch.manual_seed(123)
+        actual, seed = trainer._noise(self.x)
+        torch.manual_seed(123)
+        paths, expected_seed = generate_wiener_paths(4, 6, 7)
+        torch.testing.assert_close(actual[:, 1:], paths[:, 1:] - paths[:, :-1])
+        torch.testing.assert_close(seed, expected_seed)
+        long = noise_paths(1000, 256, self.model, 64)
+        torch.testing.assert_close(long[:, 1:64].var(), long[:, 193:].var(), rtol=0.02, atol=0)
+        self.assertAlmostEqual(long[:, 1:].var().item(), 1 / 63, delta=0.0003)
+
+    def test_return_context_loss_supervises_cumulative_price_errors(self):
+        trainer = TimeGANTrainer(self.model, TrainingConfig(sequence_length=6))
+        trainer.train_only(self.model.generator)
+        noise, _ = generate_wiener_paths(4, 6, 7)
+        context = self.model.embedder(self.x[:, :3])[:, -1].detach()
+        future = self.model.decoder(self.model.generator.continue_from(context, noise[:, 1:4]))
+        error = (future[..., 0] - self.x[:, 3:, 0]).cumsum(dim=1)
+        expected = (error / torch.arange(1, 4).sqrt()).square().mean()
+        torch.testing.assert_close(context_price_loss(self.model, self.x, noise, 3, "return"), expected)
+
+    def test_return_moment_loss_updates_only_generator(self):
+        trainer = TimeGANTrainer(self.model, TrainingConfig(
+            sequence_length=6, price_representation="return", noise_kind="wiener_increments",
+            context_horizon=2, context_loss_weight=1, price_moment_weight=10))
+        metrics = trainer.generator_step(self.x)
+        self.assertGreater(metrics["g_price_moments"], 0)
+        self.assertTrue(all(p.grad is None for p in self.model.decoder.parameters()))
+        self.assertTrue(all(p.grad is None for p in self.model.embedder.parameters()))
+        self.assertGreater(self.model.generator.cell.weight_hh.grad.abs().sum().item(), 0)
+
+    def test_return_completions_reencode_only_the_generated_past(self):
+        model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
+        model.price_representation = "return"
+        model.context_horizon = 2
+        contexts = torch.randn(4, 6, 3)
+        paths, _ = generate_wiener_paths(4, 6, 7)
+        with patch.object(model.embedder, "forward", wraps=model.embedder.forward) as encode:
+            future = complete(model, contexts, paths)
+        self.assertEqual(future.shape, (4, 5, 3))
+        torch.testing.assert_close(encode.call_args_list[0].args[0], contexts[:, -4:])
+        torch.testing.assert_close(encode.call_args_list[1].args[0],
+                                   torch.cat((contexts[:, -4:], future[:, :2]), dim=1)[:, -4:])
+        changed = paths.clone()
+        changed[:, 3:] += 100
+        torch.testing.assert_close(future[:, :2], complete(model, contexts, changed)[:, :2])
+
+    def test_innovation_prices_cannot_inherit_decoder_midpoint_bias(self):
+        model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7, price_dynamics="innovation_head")
+        model.price_representation, model.noise_kind, model.context_horizon = "return", "wiener_increments", 2
+        model.price_calibration = {"return_mean": 0.0, "return_std": 1e-5,
+                                   "log_expected_price_factor": 0.0, "sequence_length": 6}
+        contexts = torch.randn(4, 6, 3)
+        paths = noise_paths(4, 9, model, 6)
+        original = complete(model, contexts, paths)
+        with torch.no_grad():
+            model.decoder[-1].bias[0].add_(1000)
+        torch.testing.assert_close(original, complete(model, contexts, paths))
+
+    def test_price_innovations_have_the_calibrated_arithmetic_drift(self):
+        head = PriceVolatility(8)
+        with torch.no_grad():
+            for parameter in head.parameters():
+                parameter.zero_()
+            head[-2].bias.fill_(np.log(np.expm1(0.5)))
+        calibration = {"return_mean": 0.0, "return_std": 0.4,
+                       "log_expected_price_factor": float(np.log1p(0.0002)), "sequence_length": 64}
+        torch.manual_seed(7)
+        inputs = torch.randn(100_000) / 63 ** 0.5
+        returns = price_innovations(head, torch.zeros(100_000, 8), inputs, calibration)
+        self.assertAlmostEqual((returns * 0.4).exp().mean().item(), 1.0002, delta=0.003)
+
+    def test_return_innovation_checkpoint_round_trip(self):
+        with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
+            data = LOBSTERLevel10Dataset(price_representation="return")
+        config = TrainingConfig(price_representation="return", noise_kind="wiener_increments")
+        model = TimeGAN(latent_dims=8, noise_dims=7, price_dynamics="innovation_head")
+        model.price_calibration = {"return_mean": float(data.feature_mean[0]),
+                                   "return_std": float(data.feature_std[0]),
+                                   "log_expected_price_factor": 0.0, "sequence_length": 64}
+        trainer = TimeGANTrainer(model, config)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            save_checkpoint(path, model, config, data)
+            loaded, checkpoint = load_checkpoint(path)
+            self.assertEqual(checkpoint["feature_names"][0], "log_midpoint_return")
+            self.assertEqual(loaded.noise_kind, "wiener_increments")
+            torch.manual_seed(6)
+            expected = generate_features(model, 2, 64)
+            torch.manual_seed(6)
+            torch.testing.assert_close(generate_features(loaded, 2, 64), expected)
 
     def test_context_loss_has_no_future_conditioning_and_updates_only_generator(self):
         config = TrainingConfig(sequence_length=6, context_horizon=2, context_loss_weight=10)

@@ -189,3 +189,38 @@ generated-window statistics. A squared error against one observed future may
 favor smoother prices; this is an experiment in correcting the hand-off, not
 evidence of calibrated conditional uncertainty. Long rollouts still exceed
 the supervised 16-event horizon.
+
+`notebooks/lobster_timegan_return_dynamics.ipynb` investigates the remaining
+price reset with price-level, noise-reset, return, and calibrated-innovation
+forecasts. Return features replace log midpoint with its event-to-event log
+change; all normalization still uses training events. Their prices are
+integrated from the last observed midpoint. Return models use Wiener increments
+as stationary inputs and repeat the trained 48-context/16-future task, using
+only generated history after the starting prefix.
+
+Learning returns can leave a small bias that accumulates. The recommended
+**hybrid price model** uses a separate neural volatility head, fitted by Gaussian
+negative log likelihood on real training prefixes and their 16-event futures.
+Expected arithmetic-price drift is fixed to the empirical training drift.
+The lognormal correction preserves that expectation when volatility varies.
+TimeGAN generates the book structure; this head generates midpoint innovations.
+It therefore removes decoder attraction to an absolute price level, with an
+explicit restriction on directional forecasts. Volatility and joint book
+dynamics still need validation.
+
+To reproduce the comparison (the previous context-weight-100 run is the
+price-level reference):
+
+```sh
+uv run python return_price_experiment.py --weight 1
+uv run python return_price_experiment.py --weight 10
+uv run python calibrate_price_dynamics.py runs/return_price/returns_context_1_moments_10_seed_0/model.pt
+uv run python return_price_report.py
+```
+
+The unified `runs/return_price/innovation_head_seed_0/model.pt` checkpoint saves
+the volatility head and drift calibration. `load_checkpoint` selects that head
+automatically for `generate_features` and the experiment's `complete` function.
+Standalone return windows use the saved training median as their price anchor;
+conditional continuations use the actual last observed midpoint. Existing
+price-level checkpoints retain their original sampling behavior.

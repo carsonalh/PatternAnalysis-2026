@@ -212,6 +212,8 @@ def _validation_losses(model: TimeGAN, real: torch.Tensor) -> ValidationLosses:
     x = real.to(device)
     latents = model.embedder(x)
     noise, _ = generate_wiener_paths(len(x), x.shape[1], model.generator.noise_dims, device=device)
+    if getattr(model, "noise_kind", "wiener_paths") == "wiener_increments":
+        noise = torch.cat((noise[:, :1], noise[:, 1:] - noise[:, :-1]), dim=1)
     reconstruction = model.decoder(latents)
     next_latents = model.generator.teacher_forced(latents, noise)
     return ValidationLosses(
@@ -240,7 +242,7 @@ def evaluate_timegan(model: TimeGAN, training: LOBSTERLevel10Dataset,
     generated_score = next_step_mae(generated, real_validation, predictor_steps, seed)
 
     report = EvaluationReport(
-        feature_names=list(training.FEATURE_NAMES),
+        feature_names=list(training.feature_names),
         training_windows=len(real_training),
         validation_windows=len(real_validation),
         validation_losses=losses,

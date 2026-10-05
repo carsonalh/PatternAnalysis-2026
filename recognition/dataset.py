@@ -62,9 +62,13 @@ class LOBSTERLevel10Dataset(Dataset):
         + tuple(f"log1p_bid_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
     )
 
-    def __init__(self, train: bool = True, normalize: bool = True) -> None:
+    def __init__(self, train: bool = True, normalize: bool = True,
+                 price_representation: str = "level") -> None:
+        if price_representation not in ("level", "return"):
+            raise ValueError("Price representation must be level or return")
         books, _messages = load_dfs()
         self.normalize = normalize
+        self.price_representation = price_representation
         VALIDATION_RATIO = 0.15
         validation_begin = round((1 - VALIDATION_RATIO) * len(books))
 
@@ -81,6 +85,11 @@ class LOBSTERLevel10Dataset(Dataset):
             np.log1p(ask_sizes),
             np.log1p(bid_sizes),
         ))
+        if price_representation == "return":
+            # Compute before splitting: the first validation return uses only
+            # the preceding training price, never a future validation event.
+            features[:, 0] = np.r_[0.0, np.diff(np.log(midpoints))]
+        self.reference_midpoint = float(np.median(midpoints[:validation_begin]))
         self.feature_mean = features[:validation_begin].mean(axis=0)
         self.feature_std = features[:validation_begin].std(axis=0)
         self.feature_std[self.feature_std == 0] = 1
@@ -92,6 +101,12 @@ class LOBSTERLevel10Dataset(Dataset):
             features = (features - self.feature_mean) / self.feature_std
         self.features = torch.from_numpy(features.astype(np.float32))
 
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        if self.price_representation == "return":
+            return ("log_midpoint_return", *self.FEATURE_NAMES[1:])
+        return self.FEATURE_NAMES
+
     def __len__(self) -> int:
         return len(self.books)
 
@@ -101,10 +116,13 @@ class LOBSTERLevel10Dataset(Dataset):
     def feature_sequence_to_df(
         self,
         features: torch.Tensor | np.ndarray,
+        *, initial_midpoint: float | None = None,
     ) -> pd.DataFrame:
         """Reconstruct a (T, 40) feature array in original LOBSTER units.
 
-        Normalization is undone automatically; each row decodes independently.
+        Normalization is undone automatically. Level features decode per row;
+        return features accumulate from initial_midpoint (LOBSTER price units).
+        Standalone return windows default to the training median price.
         Prices are rounded to ticks; spread, gaps, and sizes are at least one.
         The returned DataFrame has a fresh RangeIndex.
         """
@@ -112,6 +130,9 @@ class LOBSTERLevel10Dataset(Dataset):
             features,
             self.feature_mean if self.normalize else None,
             self.feature_std if self.normalize else None,
+            price_representation=self.price_representation,
+            initial_midpoint=(self.reference_midpoint if initial_midpoint is None
+                              and self.price_representation == "return" else initial_midpoint),
         )
 
 
@@ -141,6 +162,7 @@ def features_to_order_book(
     features: torch.Tensor | np.ndarray,
     feature_mean: np.ndarray | None = None,
     feature_std: np.ndarray | None = None,
+    *, price_representation: str = "level", initial_midpoint: float | None = None,
 ) -> pd.DataFrame:
     """Decode (T, 40) features without loading data, e.g. from a saved model.
 
@@ -159,6 +181,13 @@ def features_to_order_book(
         raise ValueError("Provide both normalization statistics or neither")
     if feature_mean is not None:
         values = values * feature_std + feature_mean
+    if price_representation == "return":
+        if initial_midpoint is None or not np.isfinite(initial_midpoint) or initial_midpoint <= 0:
+            raise ValueError("Decoding returns requires a positive initial midpoint in LOBSTER units")
+        values = values.copy()
+        values[:, 0] = np.log(initial_midpoint) + np.cumsum(values[:, 0])
+    elif price_representation != "level":
+        raise ValueError("Price representation must be level or return")
 
     tick_size = LOBSTERLevel10Dataset.TICK_SIZE
     with np.errstate(over='raise', invalid='raise'):

@@ -14,7 +14,7 @@ from dataset import LOBSTERLevel10Dataset, ORDER_BOOK_COLUMNS, WindowDataset, fe
 from evaluation import compare_sequences, evaluate_timegan, next_step_mae, sequence_statistics
 from modules import TimeGAN
 from predict import generate_wiener_paths, generate_features, load_checkpoint
-from train import TimeGANTrainer, TrainingConfig, save_checkpoint, supervised_loss
+from train import TimeGANTrainer, TrainingConfig, context_price_loss, save_checkpoint, supervised_loss
 
 # Small recurrent tests are substantially faster without many CPU worker threads.
 torch.set_num_threads(1)
@@ -132,6 +132,20 @@ class ModelTests(unittest.TestCase):
         fake[:, -1].square().sum().backward()
         self.assertGreater(self.model.generator.initial[0].weight.grad.abs().sum().item(), 0)
 
+    def test_context_rollout_alignment_and_feedback_gradients(self):
+        initial = self.model.embedder(self.x[:, :3])[:, -1].detach().requires_grad_()
+        noise = self.noise[:, 1:4]
+        predicted = self.model.generator.continue_from(initial, noise)
+        h = initial
+        manual = []
+        for step in range(3):
+            h = self.model.generator.cell(noise[:, step], h)
+            manual.append(h)
+        torch.testing.assert_close(predicted, torch.stack(manual, dim=1))
+        predicted[:, -1].square().sum().backward()
+        self.assertGreater(initial.grad.abs().sum().item(), 0)
+        self.assertGreater(self.model.generator.cell.weight_hh.grad.abs().sum().item(), 0)
+
     def test_sampling_does_not_use_embedder_or_discriminator(self):
         with patch.object(self.model.embedder, "forward", side_effect=AssertionError), \
              patch.object(self.model.discriminator, "forward", side_effect=AssertionError):
@@ -176,6 +190,72 @@ class TrainingTests(unittest.TestCase):
         self.trainer.generator_step(self.x)
         self.assertFalse(torch.equal(before, self.model.generator.initial[0].weight))
         self.assertTrue(self.model.discriminator.training)
+
+    def test_separate_discriminator_rate_and_multiple_generator_updates(self):
+        config = TrainingConfig(sequence_length=6, discriminator_learning_rate=1e-4,
+                                generator_updates=2)
+        trainer = TimeGANTrainer(self.model, config)
+        self.assertEqual(trainer.opt_ER.param_groups[0]["lr"], config.learning_rate)
+        self.assertEqual(trainer.opt_G.param_groups[0]["lr"], config.learning_rate)
+        self.assertEqual(trainer.opt_D.param_groups[0]["lr"], 1e-4)
+        with patch.object(trainer, "discriminator_step", wraps=trainer.discriminator_step) as d, \
+             patch.object(trainer, "generator_step", wraps=trainer.generator_step) as g, \
+             patch.object(trainer, "embedding_step", wraps=trainer.embedding_step) as e:
+            metrics = trainer.joint_step(self.x)
+        self.assertEqual((d.call_count, g.call_count, e.call_count), (1, 2, 1))
+        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+        self.assertEqual(next(iter(trainer.opt_G.state.values()))["step"].item(), 2)
+        self.assertEqual(next(iter(trainer.opt_D.state.values()))["step"].item(), 1)
+
+    def test_training_balance_configuration_validation(self):
+        for rate in (0, -1e-4, float("nan"), float("inf")):
+            with self.subTest(rate=rate), self.assertRaises(ValueError):
+                TrainingConfig(discriminator_learning_rate=rate)
+        for updates in (0, -1, 1.5):
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                TrainingConfig(generator_updates=updates)
+
+    def test_context_loss_configuration_validation(self):
+        for weight in (-1, float("nan"), float("inf")):
+            with self.subTest(weight=weight), self.assertRaises(ValueError):
+                TrainingConfig(context_loss_weight=weight)
+        for horizon in (0, -1, 1.5, 64):
+            with self.subTest(horizon=horizon), self.assertRaises(ValueError):
+                TrainingConfig(context_loss_weight=1, context_horizon=horizon)
+
+    def test_context_loss_has_no_future_conditioning_and_updates_only_generator(self):
+        config = TrainingConfig(sequence_length=6, context_horizon=2, context_loss_weight=10)
+        trainer = TimeGANTrainer(self.model, config)
+        noise, _ = generate_wiener_paths(4, 6, 7)
+        trainer.train_only(self.model.generator)
+        # Changing future labels changes the loss, but cannot change the rollout.
+        changed = self.x.clone()
+        changed[:, -2:, 0] += 100
+        with patch.object(self.model.embedder, "forward", wraps=self.model.embedder.forward) as encode, \
+             patch.object(self.model.generator, "continue_from", wraps=self.model.generator.continue_from) as roll:
+            loss = context_price_loss(self.model, self.x, noise, 2)
+            first_context = roll.call_args.args[0].clone()
+            changed_loss = context_price_loss(self.model, changed, noise, 2)
+            torch.testing.assert_close(first_context, roll.call_args.args[0])
+            self.assertTrue(all(call.args[0].shape[1] == 4 for call in encode.call_args_list))
+        self.assertGreater(changed_loss.item(), loss.item())
+        loss.backward()
+        self.assertGreater(self.model.generator.cell.weight_hh.grad.abs().sum().item(), 0)
+        for network in (self.model.embedder, self.model.decoder, self.model.discriminator):
+            self.assertTrue(all(p.grad is None for p in network.parameters()))
+        self.assertIn("g_context_price", trainer.generator_step(self.x))
+
+    def test_zero_context_weight_preserves_loss_and_rng(self):
+        disabled = TimeGANTrainer(self.model, TrainingConfig(sequence_length=6, context_loss_weight=0))
+        rng_before = torch.get_rng_state()
+        with patch("train.context_price_loss", side_effect=AssertionError):
+            metrics = disabled.generator_step(self.x)
+        rng_after = torch.get_rng_state()
+        self.assertNotIn("g_context_price", metrics)
+        self.assertAlmostEqual(metrics["generator"], metrics["adversarial"] + 10 * metrics["g_supervised"], places=6)
+        torch.set_rng_state(rng_before)
+        generate_wiener_paths(4, 6, 7)
+        torch.testing.assert_close(torch.get_rng_state(), rng_after)
 
     def test_supervision_differentiates_through_frozen_generator(self):
         self.trainer.train_only(self.model.embedder, self.model.decoder)

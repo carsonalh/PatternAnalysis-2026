@@ -8,6 +8,7 @@ There is no static branch, supervisor network, or moment-matching objective.
 from dataclasses import asdict, dataclass
 from itertools import chain
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -33,6 +34,10 @@ class TrainingConfig:
     autoencoder_steps: int = 1_000
     transition_steps: int = 1_000
     joint_steps: int = 5_000
+    discriminator_learning_rate: float | None = None
+    generator_updates: int = 1
+    context_loss_weight: float = 0.0
+    context_horizon: int = 16
 
     def __post_init__(self):
         if self.sequence_length < 2 or self.batch_size < 1:
@@ -41,10 +46,41 @@ class TrainingConfig:
             raise ValueError("Learning rate/clipping must be positive and loss weights nonnegative")
         if min(self.autoencoder_steps, self.transition_steps, self.joint_steps) < 0:
             raise ValueError("Training step budgets must be nonnegative")
+        if (self.discriminator_learning_rate is not None
+                and (not math.isfinite(self.discriminator_learning_rate)
+                     or self.discriminator_learning_rate <= 0)):
+            raise ValueError("Discriminator learning rate must be finite and positive")
+        if not isinstance(self.generator_updates, int) or self.generator_updates < 1:
+            raise ValueError("Generator updates must be a positive integer")
+        if not math.isfinite(self.context_loss_weight) or self.context_loss_weight < 0:
+            raise ValueError("Context loss weight must be finite and nonnegative")
+        if not isinstance(self.context_horizon, int) or self.context_horizon < 1:
+            raise ValueError("Context horizon must be a positive integer")
+        if self.context_loss_weight > 0 and self.context_horizon >= self.sequence_length:
+            raise ValueError("Context horizon must leave at least one real context event")
 
 
 def supervised_loss(generator: nn.Module, latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(generator.teacher_forced(latents, noise), latents[:, 1:])
+
+
+def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
+                       horizon: int) -> torch.Tensor:
+    """Decoded midpoint MSE after a real prefix, using generated feedback.
+
+    Feature zero is the standardized log midpoint. Encoding only the prefix
+    prevents future targets from entering the conditioning state. Reusing the
+    start of the Wiener path resets its clock without changing increment variance.
+    """
+    if not 1 <= horizon < x.shape[1]:
+        raise ValueError("The continuation must leave a nonempty real prefix")
+    split = x.shape[1] - horizon
+    with torch.no_grad():
+        context = model.embedder(x[:, :split])[:, -1]
+    continuation = model.generator.continue_from(context, noise[:, 1:horizon + 1])
+    # R's parameters stay frozen in a G update, but gradients pass through R to G.
+    predicted_price = model.decoder(continuation)[..., 0]
+    return F.mse_loss(predicted_price, x[:, split:, 0])
 
 
 class TimeGANTrainer:
@@ -54,7 +90,10 @@ class TimeGANTrainer:
         self.opt_ER = torch.optim.Adam(chain(model.embedder.parameters(), model.decoder.parameters()),
                                        lr=config.learning_rate)
         self.opt_G = torch.optim.Adam(model.generator.parameters(), lr=config.learning_rate)
-        self.opt_D = torch.optim.Adam(model.discriminator.parameters(), lr=config.learning_rate)
+        self.opt_D = torch.optim.Adam(model.discriminator.parameters(),
+                                     lr=(config.discriminator_learning_rate
+                                         if config.discriminator_learning_rate is not None
+                                         else config.learning_rate))
 
     def train_only(self, *active: nn.Module) -> None:
         """Freeze parameters, not autograd through a frozen network's inputs."""
@@ -119,9 +158,13 @@ class TimeGANTrainer:
         adversarial = F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
         supervised = supervised_loss(self.model.generator, real, noise)
         loss = adversarial + self.config.eta * supervised
+        metrics = {"adversarial": adversarial.item(), "g_supervised": supervised.item()}
+        if self.config.context_loss_weight > 0:
+            context = context_price_loss(self.model, x, noise, self.config.context_horizon)
+            loss = loss + self.config.context_loss_weight * context
+            metrics["g_context_price"] = context.item()
         self._step(self.opt_G, loss)
-        return {"generator": loss.item(), "adversarial": adversarial.item(),
-                "g_supervised": supervised.item()}
+        return {"generator": loss.item(), **metrics}
 
     def embedding_step(self, x: torch.Tensor) -> dict[str, float]:
         self.train_only(self.model.embedder, self.model.decoder)
@@ -137,7 +180,12 @@ class TimeGANTrainer:
 
     def joint_step(self, x: torch.Tensor) -> dict[str, float]:
         # Each update recomputes its graph and draws fresh noise.
-        return (self.discriminator_step(x) | self.generator_step(x) | self.embedding_step(x))
+        metrics = self.discriminator_step(x)
+        generator_metrics = [self.generator_step(x) for _ in range(self.config.generator_updates)]
+        # Log the mean when G takes several updates in one joint iteration.
+        metrics.update({name: sum(row[name] for row in generator_metrics) / len(generator_metrics)
+                        for name in generator_metrics[0]})
+        return metrics | self.embedding_step(x)
 
     def fit(self, loader: DataLoader, log_every: int = 100) -> list[dict]:
         if len(loader) == 0:
@@ -199,12 +247,15 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("runs/timegan"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
-    for name in ("sequence_length", "batch_size", "autoencoder_steps", "transition_steps", "joint_steps"):
+    for name in ("sequence_length", "batch_size", "autoencoder_steps", "transition_steps", "joint_steps",
+                 "context_horizon"):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=getattr(defaults, name))
-    for name in ("learning_rate", "gradient_clip", "lam", "eta"):
+    for name in ("learning_rate", "gradient_clip", "lam", "eta", "context_loss_weight"):
         parser.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(defaults, name))
     parser.add_argument("--latent-dims", type=int, default=128)
     parser.add_argument("--noise-dims", type=int, default=128)
+    parser.add_argument("--discriminator-learning-rate", type=float, default=None)
+    parser.add_argument("--generator-updates", type=int, default=defaults.generator_updates)
     parser.add_argument("--evaluation-samples", type=int, default=256)
     parser.add_argument("--predictor-steps", type=int, default=200)
     parser.add_argument("--skip-evaluation", action="store_true")

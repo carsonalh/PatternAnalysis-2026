@@ -68,6 +68,22 @@ class Generator(nn.Module):
         )
         return predictions.reshape(batch, time - 1, dims)
 
+    def continue_from(self, latent: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Predict K future latents from a real context and (B, K, Z) noise.
+
+        The context latent is not an output; every prediction feeds the next
+        step, keeping gradients attached throughout the continuation.
+        """
+        if (latent.ndim != 2 or noise.ndim != 3 or noise.shape[1] < 1
+                or noise.shape[0] != latent.shape[0] or noise.shape[2] != self.noise_dims
+                or latent.shape[1] != self.cell.hidden_size):
+            raise ValueError("Expected (B, latent_dims) context and (B, K, noise_dims), K >= 1")
+        outputs = []
+        for step in range(noise.shape[1]):
+            latent = self.cell(noise[:, step], latent)
+            outputs.append(latent)
+        return torch.stack(outputs, dim=1)
+
 
 class Discriminator(nn.Module):
     """Score latent windows with one real/fake logit per event."""

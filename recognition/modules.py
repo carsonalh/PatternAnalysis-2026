@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from dataset import FEATURE_DIMS
+from price_dynamics import PriceVolatility
 
 LATENT_DIMS = 128
 
@@ -102,7 +103,7 @@ class TimeGAN(nn.Module):
     """Four temporal networks; no static covariates or separate supervisor."""
 
     def __init__(self, feature_dims: int = FEATURE_DIMS, latent_dims: int = LATENT_DIMS,
-                 noise_dims: int = LATENT_DIMS):
+                 noise_dims: int = LATENT_DIMS, price_dynamics: str = "decoder"):
         super().__init__()
         self.model_config = dict(feature_dims=feature_dims, latent_dims=latent_dims,
                                  noise_dims=noise_dims)
@@ -110,6 +111,11 @@ class TimeGAN(nn.Module):
         self.decoder = Decoder(feature_dims, latent_dims)
         self.generator = Generator(noise_dims, latent_dims)
         self.discriminator = Discriminator(latent_dims)
+        if price_dynamics == "innovation_head":
+            self.price_volatility = PriceVolatility(latent_dims)
+            self.model_config["price_dynamics"] = price_dynamics
+        elif price_dynamics != "decoder":
+            raise ValueError("Price dynamics must be decoder or innovation_head")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.embedder(x))

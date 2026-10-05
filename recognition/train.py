@@ -38,6 +38,9 @@ class TrainingConfig:
     generator_updates: int = 1
     context_loss_weight: float = 0.0
     context_horizon: int = 16
+    price_representation: str = "level"
+    noise_kind: str = "wiener_paths"
+    price_moment_weight: float = 0.0
 
     def __post_init__(self):
         if self.sequence_length < 2 or self.batch_size < 1:
@@ -58,6 +61,12 @@ class TrainingConfig:
             raise ValueError("Context horizon must be a positive integer")
         if self.context_loss_weight > 0 and self.context_horizon >= self.sequence_length:
             raise ValueError("Context horizon must leave at least one real context event")
+        if self.price_representation not in ("level", "return"):
+            raise ValueError("Price representation must be level or return")
+        if self.noise_kind not in ("wiener_paths", "wiener_increments"):
+            raise ValueError("Noise kind must be wiener_paths or wiener_increments")
+        if not math.isfinite(self.price_moment_weight) or self.price_moment_weight < 0:
+            raise ValueError("Price moment weight must be finite and nonnegative")
 
 
 def supervised_loss(generator: nn.Module, latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
@@ -65,10 +74,10 @@ def supervised_loss(generator: nn.Module, latents: torch.Tensor, noise: torch.Te
 
 
 def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
-                       horizon: int) -> torch.Tensor:
-    """Decoded midpoint MSE after a real prefix, using generated feedback.
+                       horizon: int, price_representation: str = "level") -> torch.Tensor:
+    """Decoded price-path error after a real prefix, using generated feedback.
 
-    Feature zero is the standardized log midpoint. Encoding only the prefix
+    Feature zero is standardized log midpoint or log return. Encoding only the prefix
     prevents future targets from entering the conditioning state. Reusing the
     start of the Wiener path resets its clock without changing increment variance.
     """
@@ -80,13 +89,23 @@ def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
     continuation = model.generator.continue_from(context, noise[:, 1:horizon + 1])
     # R's parameters stay frozen in a G update, but gradients pass through R to G.
     predicted_price = model.decoder(continuation)[..., 0]
-    return F.mse_loss(predicted_price, x[:, split:, 0])
+    errors = predicted_price - x[:, split:, 0]
+    if price_representation == "return":
+        # Cumulative return errors supervise the price path. Divide by sqrt(t)
+        # so later horizons do not dominate solely through accumulated variance.
+        time = torch.arange(1, horizon + 1, device=x.device, dtype=x.dtype)
+        errors = errors.cumsum(dim=1) / time.sqrt()
+    return errors.square().mean()
 
 
 class TimeGANTrainer:
     def __init__(self, model: TimeGAN, config: TrainingConfig = TrainingConfig()):
         self.model = model
         self.config = config
+        model.noise_kind = config.noise_kind
+        model.price_representation = config.price_representation
+        model.context_horizon = config.context_horizon
+        model.sequence_length = config.sequence_length
         self.opt_ER = torch.optim.Adam(chain(model.embedder.parameters(), model.decoder.parameters()),
                                        lr=config.learning_rate)
         self.opt_G = torch.optim.Adam(model.generator.parameters(), lr=config.learning_rate)
@@ -115,9 +134,12 @@ class TimeGANTrainer:
         optimizer.step()
 
     def _noise(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return generate_wiener_paths(
+        paths, seed = generate_wiener_paths(
             x.shape[0], x.shape[1], self.model.generator.noise_dims,
             device=x.device, dtype=x.dtype)
+        if self.config.noise_kind == "wiener_increments":
+            paths = torch.cat((paths[:, :1], paths[:, 1:] - paths[:, :-1]), dim=1)
+        return paths, seed
 
     def autoencoder_step(self, x: torch.Tensor) -> dict[str, float]:
         self.train_only(self.model.embedder, self.model.decoder)
@@ -160,9 +182,17 @@ class TimeGANTrainer:
         loss = adversarial + self.config.eta * supervised
         metrics = {"adversarial": adversarial.item(), "g_supervised": supervised.item()}
         if self.config.context_loss_weight > 0:
-            context = context_price_loss(self.model, x, noise, self.config.context_horizon)
+            context = context_price_loss(self.model, x, noise, self.config.context_horizon,
+                                         self.config.price_representation)
             loss = loss + self.config.context_loss_weight * context
             metrics["g_context_price"] = context.item()
+        if self.config.price_moment_weight > 0:
+            price = self.model.decoder(fake)[..., 0]
+            target = x[..., 0]
+            moments = ((price.mean() - target.mean()).square()
+                       + (price.std(correction=0) - target.std(correction=0)).square())
+            loss = loss + self.config.price_moment_weight * moments
+            metrics["g_price_moments"] = moments.item()
         self._step(self.opt_G, loss)
         return {"generator": loss.item(), **metrics}
 
@@ -224,14 +254,19 @@ def save_checkpoint(path: Path, model: TimeGAN, config: TrainingConfig,
     """Save sampling weights and the training-only feature normalization."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    checkpoint = {
         "model_state": model.state_dict(),
         "model_config": model.model_config,
         "training_config": asdict(config),
         "feature_mean": torch.as_tensor(data.feature_mean),
         "feature_std": torch.as_tensor(data.feature_std),
-        "feature_names": list(data.FEATURE_NAMES),
-    }, path)
+        "feature_names": list(data.feature_names),
+        "price_representation": data.price_representation,
+        "reference_midpoint": data.reference_midpoint,
+    }
+    if hasattr(model, "price_calibration"):
+        checkpoint["price_calibration"] = model.price_calibration
+    torch.save(checkpoint, path)
 
 
 def main():
@@ -250,12 +285,16 @@ def main():
     for name in ("sequence_length", "batch_size", "autoencoder_steps", "transition_steps", "joint_steps",
                  "context_horizon"):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=getattr(defaults, name))
-    for name in ("learning_rate", "gradient_clip", "lam", "eta", "context_loss_weight"):
+    for name in ("learning_rate", "gradient_clip", "lam", "eta", "context_loss_weight",
+                 "price_moment_weight"):
         parser.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(defaults, name))
     parser.add_argument("--latent-dims", type=int, default=128)
     parser.add_argument("--noise-dims", type=int, default=128)
     parser.add_argument("--discriminator-learning-rate", type=float, default=None)
     parser.add_argument("--generator-updates", type=int, default=defaults.generator_updates)
+    parser.add_argument("--price-representation", choices=("level", "return"), default="level")
+    parser.add_argument("--noise-kind", choices=("wiener_paths", "wiener_increments"),
+                        default="wiener_paths")
     parser.add_argument("--evaluation-samples", type=int, default=256)
     parser.add_argument("--predictor-steps", type=int, default=200)
     parser.add_argument("--skip-evaluation", action="store_true")
@@ -269,7 +308,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    train_data = LOBSTERLevel10Dataset(train=True)
+    train_data = LOBSTERLevel10Dataset(train=True, price_representation=config.price_representation)
     loader = DataLoader(WindowDataset(train_data.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True)
     model = TimeGAN(latent_dims=args.latent_dims, noise_dims=args.noise_dims).to(args.device)
@@ -278,7 +317,7 @@ def main():
     save_checkpoint(args.output / "model.pt", model, config, train_data)
     pd.DataFrame(history).to_csv(args.output / "losses.csv", index=False)
     if not args.skip_evaluation:
-        validation_data = LOBSTERLevel10Dataset(train=False)
+        validation_data = LOBSTERLevel10Dataset(train=False, price_representation=config.price_representation)
         report, generated = evaluate_timegan(model, train_data, validation_data,
                                              config.sequence_length, args.evaluation_samples,
                                              args.predictor_steps, args.seed)

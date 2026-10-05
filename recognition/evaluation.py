@@ -135,7 +135,7 @@ def evaluate_timegan(model: TimeGAN, training: LOBSTERLevel10Dataset,
                             for window in windows])
 
     report = {
-        "feature_names": list(training.FEATURE_NAMES),
+        "feature_names": list(training.feature_names),
         "training_windows": len(real_training),
         "validation_windows": len(real_validation),
         "validation_losses": _validation_losses(model, real_validation),

@@ -44,12 +44,35 @@ def noise_paths(batch, horizon, model, sequence_length):
         batch, horizon + 1, model.generator.noise_dims,
         device=parameter.device, dtype=parameter.dtype, rng=rng,
     )
-    return paths * (horizon / (sequence_length - 1)) ** 0.5
+    paths = paths * (horizon / (sequence_length - 1)) ** 0.5
+    if getattr(model, "noise_kind", "wiener_paths") == "wiener_increments":
+        paths = torch.cat((paths[:, :1], paths[:, 1:] - paths[:, :-1]), dim=1)
+    return paths
 
 
 @torch.inference_mode()
 def complete(model, contexts, paths, chunk_size=1024):
-    """Decode generated latents in chunks without resetting recurrent history."""
+    """Continue an observed prefix using only generated history thereafter."""
+    if hasattr(model, "price_volatility"):
+        from price_dynamics import innovation_completion
+        return innovation_completion(model, model.price_volatility, contexts, paths,
+                                      model.price_calibration)
+    if getattr(model, "price_representation", "level") == "return":
+        # Repeat the trained conditional task using only generated history.
+        # No validation observations or price offsets are inserted mid-forecast.
+        block = model.context_horizon
+        context_length = contexts.shape[1] - block
+        if context_length < 1:
+            raise ValueError("The continuation needs a nonempty context")
+        history = contexts[:, -context_length:]
+        outputs = []
+        for start in range(0, paths.shape[1] - 1, block):
+            noise = paths[:, start + 1:start + block + 1]
+            latent = model.embedder(history)[:, -1]
+            future = model.decoder(model.generator.continue_from(latent, noise))
+            outputs.append(future.cpu())
+            history = torch.cat((history, future), dim=1)[:, -context_length:]
+        return torch.cat(outputs, dim=1)
     h = model.embedder(contexts)[:, -1]
     horizon = paths.shape[1] - 1
     features = torch.empty(len(contexts), horizon, model.model_config["feature_dims"])
@@ -83,11 +106,13 @@ No validation events are used for training, and normalization stays fixed.
     paths = noise_paths(len(paired_contexts), horizon, model, length)
     fake = complete(model, paired_contexts, paths)
 
-    def project(sequences):
-        return np.stack([midpoint(training.feature_sequence_to_df(sequence)) for sequence in sequences])
+    def project(sequences, anchors):
+        return np.stack([midpoint(training.feature_sequence_to_df(
+            sequence, initial_midpoint=anchor * 10_000))
+            for sequence, anchor in zip(sequences, anchors)])
 
-    generated = project(fake).reshape(len(contexts), samples, horizon)
-    zero = project(complete(model, contexts, paths[:len(contexts)] * 0))
+    generated = project(fake, np.repeat(initial, samples)).reshape(len(contexts), samples, horizon)
+    zero = project(complete(model, contexts, paths[:len(contexts)] * 0), initial)
     rises = generated[:, :, 63] - initial[:, None]
     endpoint_errors = generated[:, :, 63] - observed[:, 63, None]
     context_rows = pd.DataFrame({
@@ -175,7 +200,8 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "model.pt").exists():
         raise FileExistsError(f"A completed run already exists at {directory}; choose another output.")
-    training, validation = LOBSTERLevel10Dataset(True), LOBSTERLevel10Dataset(False)
+    training = LOBSTERLevel10Dataset(True, price_representation=config.price_representation)
+    validation = LOBSTERLevel10Dataset(False, price_representation=config.price_representation)
     # Independent sampler RNG keeps real batches identical even with extra G updates.
     loader = DataLoader(WindowDataset(training.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True,
@@ -187,6 +213,10 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     elapsed = time.monotonic() - started
     save_checkpoint(directory / "model.pt", model, config, training)
     pd.DataFrame(history).to_csv(directory / "losses.csv", index=False)
+    measured, curves, contexts = diagnostics(model, training, validation, config)
+    (directory / "diagnostics_final.json").write_text(
+        json.dumps({"metrics": measured, "curves": curves}, indent=2, allow_nan=False) + "\n")
+    contexts.to_csv(directory / "contexts_final.csv", index=False)
     metadata = {
         "experiment": experiment, "seed": seed, "threads": threads,
         "training_config": asdict(config), "model_config": model.model_config,
@@ -205,8 +235,10 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     context = training.features[-config.sequence_length:][None]
     noisy = complete(model, context.repeat(3, 1, 1), paths)
     zero = complete(model, context, paths[:1] * 0)
-    full_curves = np.stack([midpoint(training.feature_sequence_to_df(sequence)) for sequence in noisy])
-    zero_curve = midpoint(training.feature_sequence_to_df(zero[0]))
+    anchor = midpoint(training.books)[-1] * 10_000
+    full_curves = np.stack([midpoint(training.feature_sequence_to_df(
+        sequence, initial_midpoint=anchor)) for sequence in noisy])
+    zero_curve = midpoint(training.feature_sequence_to_df(zero[0], initial_midpoint=anchor))
     np.savez_compressed(directory / "completion_midpoints.npz", noisy=full_curves, zero=zero_curve)
     logging.info("Completed in %.1f minutes; results saved to %s", elapsed / 60, directory)
 

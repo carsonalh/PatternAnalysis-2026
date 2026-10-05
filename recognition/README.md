@@ -123,3 +123,11 @@ windows and compares reconstructed books. Instantiate recovery with
 `Decoder()`; the embedder now requires `(batch, time, features)` inputs rather
 than independent snapshots. `notebooks/wiener_process.ipynb` demonstrates the
 correct square-root scaling of Wiener increments.
+
+`notebooks/lobster_timegan_noise_ablation.ipynb` compares three paired midpoint
+continuations at Wiener amplitudes 1, 0.5, 0.25, and 0, with a separate chart
+for each case. It reuses one saved checkpoint to isolate inference-time noise
+sensitivity; variance scales with the square of amplitude. Full-validation
+rollouts retain the training variance per event and extend beyond the trained
+window length. The notebook also compares price-change statistics and the
+spread between completion endpoints.

@@ -2,7 +2,8 @@
 
 Objectives follow TimeGAN equations (7)-(11), using non-saturating BCE for G:
 https://proceedings.neurips.cc/paper/2019/file/c9efe5f26cd17ba6216bbe2a7d26d490-Paper.pdf
-There is no static branch, supervisor network, or moment-matching objective.
+There is no static branch or separate supervisor network. Optional midpoint
+log-return context and moment losses extend the joint generator objective.
 """
 
 from dataclasses import asdict, dataclass
@@ -38,8 +39,7 @@ class TrainingConfig:
     generator_updates: int = 1
     context_loss_weight: float = 0.0
     context_horizon: int = 16
-    price_representation: str = "level"
-    noise_kind: str = "wiener_paths"
+    noise_kind: str = "wiener_increments"
     price_moment_weight: float = 0.0
 
     def __post_init__(self):
@@ -61,8 +61,6 @@ class TrainingConfig:
             raise ValueError("Context horizon must be a positive integer")
         if self.context_loss_weight > 0 and self.context_horizon >= self.sequence_length:
             raise ValueError("Context horizon must leave at least one real context event")
-        if self.price_representation not in ("level", "return"):
-            raise ValueError("Price representation must be level or return")
         if self.noise_kind not in ("wiener_paths", "wiener_increments"):
             raise ValueError("Noise kind must be wiener_paths or wiener_increments")
         if not math.isfinite(self.price_moment_weight) or self.price_moment_weight < 0:
@@ -74,10 +72,10 @@ def supervised_loss(generator: nn.Module, latents: torch.Tensor, noise: torch.Te
 
 
 def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
-                       horizon: int, price_representation: str = "level") -> torch.Tensor:
+                       horizon: int) -> torch.Tensor:
     """Decoded price-path error after a real prefix, using generated feedback.
 
-    Feature zero is standardized log midpoint or log return. Encoding only the prefix
+    Feature zero is standardized midpoint log return. Encoding only the prefix
     prevents future targets from entering the conditioning state. Reusing the
     start of the Wiener path resets its clock without changing increment variance.
     """
@@ -88,13 +86,12 @@ def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
         context = model.embedder(x[:, :split])[:, -1]
     continuation = model.generator.continue_from(context, noise[:, 1:horizon + 1])
     # R's parameters stay frozen in a G update, but gradients pass through R to G.
-    predicted_price = model.decoder(continuation)[..., 0]
-    errors = predicted_price - x[:, split:, 0]
-    if price_representation == "return":
-        # Cumulative return errors supervise the price path. Divide by sqrt(t)
-        # so later horizons do not dominate solely through accumulated variance.
-        time = torch.arange(1, horizon + 1, device=x.device, dtype=x.dtype)
-        errors = errors.cumsum(dim=1) / time.sqrt()
+    predicted_returns = model.decoder(continuation)[..., 0]
+    errors = predicted_returns - x[:, split:, 0]
+    # Cumulative log-return errors supervise the price path. Divide by sqrt(t)
+    # so later horizons do not dominate solely through accumulated variance.
+    time = torch.arange(1, horizon + 1, device=x.device, dtype=x.dtype)
+    errors = errors.cumsum(dim=1) / time.sqrt()
     return errors.square().mean()
 
 
@@ -103,7 +100,6 @@ class TimeGANTrainer:
         self.model = model
         self.config = config
         model.noise_kind = config.noise_kind
-        model.price_representation = config.price_representation
         model.context_horizon = config.context_horizon
         model.sequence_length = config.sequence_length
         self.opt_ER = torch.optim.Adam(chain(model.embedder.parameters(), model.decoder.parameters()),
@@ -182,15 +178,14 @@ class TimeGANTrainer:
         loss = adversarial + self.config.eta * supervised
         metrics = {"adversarial": adversarial.item(), "g_supervised": supervised.item()}
         if self.config.context_loss_weight > 0:
-            context = context_price_loss(self.model, x, noise, self.config.context_horizon,
-                                         self.config.price_representation)
+            context = context_price_loss(self.model, x, noise, self.config.context_horizon)
             loss = loss + self.config.context_loss_weight * context
             metrics["g_context_price"] = context.item()
         if self.config.price_moment_weight > 0:
-            price = self.model.decoder(fake)[..., 0]
+            returns = self.model.decoder(fake)[..., 0]
             target = x[..., 0]
-            moments = ((price.mean() - target.mean()).square()
-                       + (price.std(correction=0) - target.std(correction=0)).square())
+            moments = ((returns.mean() - target.mean()).square()
+                       + (returns.std(correction=0) - target.std(correction=0)).square())
             loss = loss + self.config.price_moment_weight * moments
             metrics["g_price_moments"] = moments.item()
         self._step(self.opt_G, loss)
@@ -261,7 +256,7 @@ def save_checkpoint(path: Path, model: TimeGAN, config: TrainingConfig,
         "feature_mean": torch.as_tensor(data.feature_mean),
         "feature_std": torch.as_tensor(data.feature_std),
         "feature_names": list(data.feature_names),
-        "price_representation": data.price_representation,
+        "price_representation": "log_return",  # Checkpoint format marker, not a training option.
         "reference_midpoint": data.reference_midpoint,
     }
     torch.save(checkpoint, path)
@@ -277,7 +272,7 @@ def main():
 
     defaults = TrainingConfig()
     parser = argparse.ArgumentParser(description="Train a recurrent event-time TimeGAN on AMZN")
-    parser.add_argument("--output", type=Path, default=Path("runs/timegan"))
+    parser.add_argument("--output", type=Path, default=Path("runs/log_return/timegan"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     for name in ("sequence_length", "batch_size", "autoencoder_steps", "transition_steps", "joint_steps",
@@ -290,9 +285,8 @@ def main():
     parser.add_argument("--noise-dims", type=int, default=128)
     parser.add_argument("--discriminator-learning-rate", type=float, default=None)
     parser.add_argument("--generator-updates", type=int, default=defaults.generator_updates)
-    parser.add_argument("--price-representation", choices=("level", "return"), default="level")
     parser.add_argument("--noise-kind", choices=("wiener_paths", "wiener_increments"),
-                        default="wiener_paths")
+                        default=defaults.noise_kind)
     parser.add_argument("--evaluation-samples", type=int, default=256)
     parser.add_argument("--predictor-steps", type=int, default=200)
     parser.add_argument("--skip-evaluation", action="store_true")
@@ -306,7 +300,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    train_data = LOBSTERLevel10Dataset(train=True, price_representation=config.price_representation)
+    train_data = LOBSTERLevel10Dataset(train=True)
     loader = DataLoader(WindowDataset(train_data.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True)
     model = TimeGAN(latent_dims=args.latent_dims, noise_dims=args.noise_dims).to(args.device)
@@ -315,7 +309,7 @@ def main():
     save_checkpoint(args.output / "model.pt", model, config, train_data)
     pd.DataFrame(history).to_csv(args.output / "losses.csv", index=False)
     if not args.skip_evaluation:
-        validation_data = LOBSTERLevel10Dataset(train=False, price_representation=config.price_representation)
+        validation_data = LOBSTERLevel10Dataset(train=False)
         report, generated = evaluate_timegan(model, train_data, validation_data,
                                              sequence_length=config.sequence_length,
                                              samples=args.evaluation_samples,

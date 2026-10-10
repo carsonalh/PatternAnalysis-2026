@@ -50,25 +50,21 @@ def load_dfs() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 class LOBSTERLevel10Dataset(Dataset):
-    """Event-time book features, optionally standardized using the training split."""
+    """Midpoint log returns and book structure, scaled using training events only."""
 
     FEATURE_DIMS: ClassVar = FEATURE_DIMS
     TICK_SIZE: ClassVar = 100  # One cent in LOBSTER's 1/10000-dollar price units.
     FEATURE_NAMES: ClassVar = (
-        ("log_midpoint", "log1p_spread")
+        ("log_midpoint_return", "log1p_spread")
         + tuple(f"log1p_ask_gap_{i}" for i in range(2, _ORDER_BOOK_LEVELS + 1))
         + tuple(f"log1p_bid_gap_{i}" for i in range(2, _ORDER_BOOK_LEVELS + 1))
         + tuple(f"log1p_ask_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
         + tuple(f"log1p_bid_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
     )
 
-    def __init__(self, train: bool = True, normalize: bool = True,
-                 price_representation: str = "level") -> None:
-        if price_representation not in ("level", "return"):
-            raise ValueError("Price representation must be level or return")
+    def __init__(self, train: bool = True, normalize: bool = True) -> None:
         books, _messages = load_dfs()
         self.normalize = normalize
-        self.price_representation = price_representation
         VALIDATION_RATIO = 0.15
         validation_begin = round((1 - VALIDATION_RATIO) * len(books))
 
@@ -77,24 +73,25 @@ class LOBSTERLevel10Dataset(Dataset):
         ask_sizes = books[[f"ASKs{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
         bid_sizes = books[[f"BIDs{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
         midpoints = 0.5 * (asks[:, 0] + bids[:, 0])
+        # r_t = log(m_t / m_{t-1}). Compute before splitting so the first
+        # validation return uses the last training price, never a future event.
+        log_returns = np.r_[0.0, np.diff(np.log(midpoints))]
         features = np.column_stack((
-            np.log(midpoints),
+            log_returns,
             np.log1p((asks[:, 0] - bids[:, 0]) / self.TICK_SIZE),
             np.log1p(np.diff(asks, axis=1) / self.TICK_SIZE),
             np.log1p(-np.diff(bids, axis=1) / self.TICK_SIZE),
             np.log1p(ask_sizes),
             np.log1p(bid_sizes),
         ))
-        if price_representation == "return":
-            # Compute before splitting: the first validation return uses only
-            # the preceding training price, never a future validation event.
-            features[:, 0] = np.r_[0.0, np.diff(np.log(midpoints))]
         self.reference_midpoint = float(np.median(midpoints[:validation_begin]))
         self.feature_mean = features[:validation_begin].mean(axis=0)
         self.feature_std = features[:validation_begin].std(axis=0)
         self.feature_std[self.feature_std == 0] = 1
 
         begin, end = (0, validation_begin) if train else (validation_begin, len(books))
+        # Anchor for reconstructing this split; the first day event has return zero.
+        self.initial_midpoint = float(midpoints[max(0, begin - 1)])
         self.books = books.iloc[begin:end]
         features = features[begin:end]
         if self.normalize:
@@ -103,8 +100,6 @@ class LOBSTERLevel10Dataset(Dataset):
 
     @property
     def feature_names(self) -> tuple[str, ...]:
-        if self.price_representation == "return":
-            return ("log_midpoint_return", *self.FEATURE_NAMES[1:])
         return self.FEATURE_NAMES
 
     def __len__(self) -> int:
@@ -120,9 +115,10 @@ class LOBSTERLevel10Dataset(Dataset):
     ) -> pd.DataFrame:
         """Reconstruct a (T, 40) feature array in original LOBSTER units.
 
-        Normalization is undone automatically. Level features decode per row;
-        return features accumulate from initial_midpoint (LOBSTER price units).
-        Standalone return windows default to the training median price.
+        Normalization is undone automatically. Midpoint log returns recover
+        m_t = m_anchor * exp(cumsum(r)_t).
+        initial_midpoint is in LOBSTER price units; standalone log-return
+        windows default to the training median price.
         Prices are rounded to ticks; spread, gaps, and sizes are at least one.
         The returned DataFrame has a fresh RangeIndex.
         """
@@ -130,9 +126,7 @@ class LOBSTERLevel10Dataset(Dataset):
             features,
             self.feature_mean if self.normalize else None,
             self.feature_std if self.normalize else None,
-            price_representation=self.price_representation,
-            initial_midpoint=(self.reference_midpoint if initial_midpoint is None
-                              and self.price_representation == "return" else initial_midpoint),
+            initial_midpoint=self.reference_midpoint if initial_midpoint is None else initial_midpoint,
         )
 
 
@@ -162,7 +156,7 @@ def features_to_order_book(
     features: torch.Tensor | np.ndarray,
     feature_mean: np.ndarray | None = None,
     feature_std: np.ndarray | None = None,
-    *, price_representation: str = "level", initial_midpoint: float | None = None,
+    *, initial_midpoint: float | None = None,
 ) -> pd.DataFrame:
     """Decode (T, 40) features without loading data, e.g. from a saved model.
 
@@ -181,13 +175,10 @@ def features_to_order_book(
         raise ValueError("Provide both normalization statistics or neither")
     if feature_mean is not None:
         values = values * feature_std + feature_mean
-    if price_representation == "return":
-        if initial_midpoint is None or not np.isfinite(initial_midpoint) or initial_midpoint <= 0:
-            raise ValueError("Decoding returns requires a positive initial midpoint in LOBSTER units")
-        values = values.copy()
-        values[:, 0] = np.log(initial_midpoint) + np.cumsum(values[:, 0])
-    elif price_representation != "level":
-        raise ValueError("Price representation must be level or return")
+    if initial_midpoint is None or not np.isfinite(initial_midpoint) or initial_midpoint <= 0:
+        raise ValueError("Decoding log returns requires a positive initial midpoint in LOBSTER units")
+    values = values.copy()
+    values[:, 0] = np.log(initial_midpoint) + np.cumsum(values[:, 0])
 
     tick_size = LOBSTERLevel10Dataset.TICK_SIZE
     with np.errstate(over='raise', invalid='raise'):

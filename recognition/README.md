@@ -1,188 +1,135 @@
 # Recurrent TimeGAN for AMZN limit order books
 
-A university feasibility study using one day of LOBSTER AMZN level-10 data
-(2012-06-21). This baseline follows the four-network formulation of the
+A university feasibility study using the LOBSTER AMZN level-10 sample for
+21 June 2012. The model follows the four-network formulation of the
 [TimeGAN paper](https://proceedings.neurips.cc/paper/2019/file/c9efe5f26cd17ba6216bbe2a7d26d490-Paper.pdf),
-with direct latent recurrence and no static features. It models event order,
-not the elapsed time between orders.
+with direct latent recurrence. It models event order, rather than elapsed time.
 
-## Model and data
+## Fixed feature representation
 
-The 40 inputs are standardized log midpoint, spread, price gaps, and sizes.
-The first 85% of events are training data; the last 15% are held out. Both
-splits use normalization fitted only on training events. Windows are formed
-after splitting, and shuffling changes window order without changing event
-order inside a window. Training windows overlap with stride 1; evaluation
-uses nonoverlapping windows distributed across each split.
+Every training, reconstruction, generation, and prediction path uses the same
+40 features:
 
-- `Embedder`: a causal GRU, `40 → 128`, producing one latent per event.
-- `Decoder`: an MLP, `128 → 256 → 256 → 40`, with linear feature outputs.
-- `Generator`: `GRUCell(128, 128)` whose recurrent state is the latent.
-- `Discriminator`: a bidirectional GRU with 64 units per direction and one
-  linear real/fake logit per event.
+- Midpoint **log return**: `r_t = log(m_t / m_{t-1})`.
+- Spread: `log1p(spread / tick_size)`.
+- Eighteen adjacent ask/bid gaps: `log1p(gap / tick_size)`.
+- Twenty ask/bid order sizes: `log1p(shares)`.
 
-Each latent summarizes its history, but the model retains the entire latent
-sequence. The 128-dimensional representation expands each event's 40 inputs;
-it is not a smaller per-event bottleneck.
+There is no price-representation argument in the dataset or training configuration.
+Feature zero is always `log_midpoint_return`. The first event of the day has
+return zero; the first validation return uses the last training midpoint.
+The first 85% of events are training data and the remaining 15% are validation.
+Both splits use normalization fitted only on training events. Windows are formed
+within each split, and shuffling preserves event order within a window.
 
-`Generator.sample(paths, seed)` feeds generated latents back. The first latent
-is `tanh(Linear(seed))`, using independent Gaussian noise, not static covariates.
-`Generator.teacher_forced(latents, paths)` uses the real previous latent with
-the same cell weights. Wiener paths have 128 independent channels, start at
-zero, and use increments with standard deviation `sqrt(1 / (T - 1))` on a
-normalized event grid spanning `[0, 1]`.
+TimeGAN's decoder predicts all 40 standardized features. It never predicts an
+absolute midpoint price. Book export and dollar-price plots undo normalization
+and compute `m_t = m_anchor * exp(cumsum(r)_t)`. Conditional forecasts use the
+last observed midpoint as their anchor. Independent generated windows use the
+saved training median and restart accumulation for each window. Reconstruction
+uses the actual midpoint preceding each observed window.
 
-## Training
+Prices remain in LOBSTER's 1/10,000-dollar units until plotting or reporting.
+Tick rounding and positive spread, gap, and size constraints are applied during
+book conversion, outside the differentiable model. No external price process,
+fixed drift, or validation future modifies decoder predictions.
+
+## Model and training
+
+- `Embedder`: causal GRU, `40 → 128`, one history summary per event.
+- `Decoder`: MLP, `128 → 256 → 256 → 40`, with linear outputs.
+- `Generator`: `GRUCell(128, 128)` with generated latents fed back as state.
+- `Discriminator`: bidirectional GRU with 64 units per direction and a real/fake logit.
+
+The default noise inputs are stationary Wiener increments with variance
+`1 / (T - 1)` for a training window of length `T`. A separate Gaussian vector
+initializes an unconditional sequence. The accumulated-path noise option is
+retained for noise experiments; it does not change any dataset feature.
 
 ```sh
 uv run python main.py
 ```
 
-Defaults are 64 events per window, batch size 64, Adam at `3e-4`, and gradient
-clipping at norm 1. The data ZIP is downloaded into `data/` if it is not cached.
-CUDA is selected when available; use `--device cpu` to select CPU explicitly.
+Defaults are 64-event windows, batch size 64, Adam at `3e-4`, and gradient clipping
+at norm 1. Training fits the embedder/decoder for 1,000 reconstruction updates,
+the generator for 1,000 teacher-forced transition updates, then all networks for
+5,000 joint iterations. The default output is `runs/log_return/timegan/`.
+The sample ZIP is downloaded into `data/` if it is not already cached.
 
-There are three stages:
+Reconstruction uses `MSE(R(E(X)), X)`. Joint generator training combines
+adversarial feedback with latent transition supervision. Embedder/decoder
+training combines reconstruction and latent supervision. Optional context
+supervision matches cumulative log-return errors after a real prefix;
+return-moment matching penalizes generated log-return mean and SD errors.
+The objectives use the four-network direct-recurrence formulation, rather than
+a separate supervisor network.
 
-1. 1,000 reconstruction updates of the embedder and decoder.
-2. 1,000 supervised transition updates of the generator with the embedder frozen.
-3. 5,000 joint iterations: one discriminator update, one generator update, and
-   one embedder/decoder update, with fresh noise and graphs for each update.
+The notebooks use context weight 1, return-moment weight 10, discriminator rate
+`1e-4`, and a 16-event continuation after 48 real context events. A context-weight-10
+run provides a comparison with the same feature space, architecture, noise,
+seed, data sampler, and stage budgets. See the [notebook guide](notebooks/README.md)
+for their training and report commands.
 
-The losses are `L_R = MSE(R(E(X)), X)` and
-`L_S = MSE(G.teacher_forced(H, W), H[:, 1:])`. During joint training, the
-generator minimizes real-label BCE plus `10 * L_S`; the embedder/decoder
-minimize `L_R + L_S`. Freezing a network's parameters does not disable gradients
-through its inputs. The random initializer is trained by the adversarial loss,
-not transition pretraining.
-
-The objectives follow [Supplementary Algorithm 1](https://www.vanderschaar-lab.com/papers/NIPS2019_TGAN_Supplementary.pdf).
-The warm-up stages and non-saturating generator loss are practical training
-choices. This baseline does not reproduce the separate supervisor or
-moment-matching losses in the authors' released implementation.
-
-For a quick pipeline check:
+For a short procedure check:
 
 ```sh
-uv run python main.py --autoencoder-steps 10 --transition-steps 10 --joint-steps 10 --evaluation-samples 16 --predictor-steps 20 --output runs/smoke
+uv run python main.py --autoencoder-steps 10 --transition-steps 10 --joint-steps 10 --evaluation-samples 16 --predictor-steps 20 --output runs/log_return/smoke
 ```
 
-Step budgets, loss weights, learning rate, batch size, sequence length, noise
-dimension, and latent dimension are configurable; see `python main.py --help`.
-`--discriminator-learning-rate` overrides only the discriminator's rate;
-otherwise all networks use `--learning-rate`. `--generator-updates` controls
-the number of generator updates per joint iteration (default 1). Each takes
-fresh noise; logged generator losses are averaged across those updates.
-The default output directory is `runs/timegan/`:
+Check `python main.py --help` for training settings. Checkpoints save network
+weights, the fixed feature names, and training normalization. They support
+sampling, but do not store optimizer state for resumed training.
 
-- `model.pt`: all network weights, model configuration, and training normalization.
-- `losses.csv`: every update's losses, labeled by training stage.
-- `evaluation.json`: held-out reconstruction/transition losses, feature statistics,
-  projected book statistics, and predictive scores.
-- `generated_features.npy`: generated standardized feature windows.
-- `sample_order_book.csv`: one generated window in original LOBSTER units.
-
-`--skip-evaluation` saves just weights and loss history. Checkpoints support
-sampling; they do not store optimizer state for training resumption.
-
-## Sampling and evaluation
+## Predictions and evaluation
 
 ```sh
-uv run python predict.py runs/timegan/model.pt --samples 16 --output runs/samples
+uv run python predict.py runs/log_return/returns_context_1_moments_10_seed_0/model.pt --samples 16 --output runs/log_return/samples
 ```
 
-Sampling needs no real data or network access. It saves standardized features
-and one decoded CSV per window. The saved normalization is reused, and the
-checkpoint's window length determines the event grid. Tick rounding and
-positive spread/gap/size constraints are applied only during CSV conversion,
-outside the differentiable model.
+Sampling needs no real books. It writes standardized log-return feature windows
+and one anchored book CSV per window. Loading a checkpoint checks that its
+features match the fixed log-return dataset; old price-level weights are rejected.
+Historical log-return checkpoints remain readable because their feature names
+and normalization already describe the same fixed features.
 
-The evaluation report compares feature means, standard deviations, changes,
-lag-one correlations, cross-feature correlations, and variation across window
-means before book conversion. After conversion, it reports spread, depth,
-and midpoint-change statistics. Correlations involving constant features are
-reported as zero. Book projection enforces valid snapshots; it does not prove
-that generated temporal dynamics are realistic.
+Conditional continuations repeatedly encode generated feature history, then
+predict another block of log-return features. Validation observations never
+enter an ongoing rollout. Long continuations can accumulate learned return bias;
+log-return prediction removes the absolute-price reset mechanism but does not
+guarantee realistic drift, volatility, or book structure.
 
-Predictive evaluation trains two small GRU next-step predictors with identical
-initialization and update budgets: one on real training windows and one on
-generated windows. Both are scored by MAE on held-out real windows, in
-standardized feature units. Defaults use up to 256 windows per split and 200
-predictor updates. These are small feasibility checks, not evidence of
-out-of-day generalization or guaranteed generation quality.
+Evaluation compares all 40 features before book conversion, including midpoint
+log returns. It reports feature moments, temporal and cross-feature dependence,
+and variation across windows. After book conversion it measures spreads, depth,
+and midpoint changes. Real book statistics retain observed prices and anchors.
+Next-event predictors train and score in the same standardized log-return feature
+space. Valid projected books do not establish realistic temporal generation.
 
-## Checks
+## Notebooks
+
+Read the [four chapters](notebooks/README.md) in order. Executed plots and tables
+are saved for reading without retraining:
+
+1. Data, fixed log-return features, normalization, and conversion checks.
+2. TimeGAN training, log-return reconstruction, and boundary predictions.
+3. Log-return noise ablation, context-loss comparison, and long continuations.
+4. Generation distributions, joint/temporal structure, and next-event prediction.
+
+All current notebook predictions use models under `runs/log_return/`.
+Earlier price-level experiment artifacts remain under `runs/` for historical
+traceability and are excluded from current predictions. `data/` and `runs/`
+are ignored by Git; preserve the checkpoints, normalization, and reports separately.
+
+## Checks and research limits
 
 ```sh
 uv run python -m unittest discover -s tests -v
 ```
 
-Tests cover split boundaries, normalization, window order, Wiener variance and
-channel independence, causality, state resets, teacher-forcing alignment,
-gradient flow and optimizer ownership, checkpoint sampling, and learning
-transitions on synthetic autoregressive sequences.
+Tests cover the fixed log-return target, split boundaries, normalization, anchored
+reconstruction, rejection of price-level checkpoints, window order, noise variance,
+causality, gradient flow, optimizer ownership, and data-independent sampling.
 
-## Notebook reading order
-
-The four notebooks form one feasibility review. They have executed plots and
-tables and can also be run independently from the project or notebook directory.
-The [notebook guide](notebooks/README.md) lists required artifacts and reproduction
-commands. Training is opt-in; existing experimental outputs remain in `runs/`.
-
-1. [AMZN data and features](notebooks/order_book_analysis.ipynb): the trading day,
-   spread and gap structure, opening outliers, training-only normalization, and
-   conversion checks for price-level and return features.
-2. [Baseline TimeGAN](notebooks/lobster_timegan.ipynb): architecture, stage losses,
-   current-model reconstruction checks, and an exploratory completion overview.
-3. [Price dynamics experiments](notebooks/lobster_timegan_return_dynamics.ipynb):
-   paired inference-noise ablation, training balance, context loss, and
-   decoder-generated returns, with successful and unsuccessful controls
-   in shared comparisons.
-4. [Generation evaluation](notebooks/lobster_timegan_return_distributions.ipynb):
-   price-level versus return TimeGAN midpoint and gap returns, histogram KL, spread/depth,
-   temporal and joint structure, and a common-feature prediction check.
-
-The earlier statistics, preprocessing, autoencoder, and Wiener demonstrations
-are incorporated into these chapters. Separate noise, balance, and context-loss
-notebooks are consolidated into chapter 3. The unrelated MNIST and volatility
-learning exercises are removed; their prior versions remain in Git history.
-
-## Price dynamics variants
-
-The optional `--context-loss-weight` adds decoded midpoint supervision to the
-joint generator objective. Its default of 0 preserves the baseline. With
-`--context-horizon 16`, a 48-event real prefix conditions 16 generated events.
-Only the generator is updated by this term; gradients pass through the frozen
-decoder. This improves the handoff in the measured runs but does not establish
-realistic longer continuations or calibrated uncertainty.
-
-The return variant replaces only log midpoint with its event-to-event log
-return and uses stationary Wiener increments. The other 39 features remain
-unchanged. Prices integrate from the starting midpoint. The return experiments
-also change context supervision and add return moment matching, so their
-comparison with the baseline does not isolate representation alone.
-
-All generated features, including midpoint returns, come from the TimeGAN
-**decoder**. The return checkpoint emits a standardized log return as feature
-zero. Reverse training normalization and accumulate these returns from a
-starting midpoint to recover prices. No separate price model replaces this
-output and no expected drift is imposed at inference. A learned return bias
-can still accumulate and must be reported as a generation error.
-
-The current return example uses
-`runs/return_price/returns_context_1_moments_10_seed_0/model.pt`:
-
-```sh
-uv run python predict.py runs/return_price/returns_context_1_moments_10_seed_0/model.pt --samples 16 --output runs/return_samples
-```
-
-Standalone return windows each use the saved training median as their price
-anchor; conditional continuations use the last observed midpoint. Return
-accumulation resets between independent windows. The price-level baseline
-remains a control. Checkpoints from the removed external-price experiment
-are rejected rather than silently replacing the decoder midpoint output.
-
-These are one-day, one-training-seed development comparisons. Validation has
-been repeatedly inspected while selecting interventions, so it is not an
-untouched final test set. A corrected price reset alone is not evidence of
-realistic full-book generation or out-of-day generalization.
+This is a one-day, one-training-seed-per-setting development study. Validation
+has been inspected repeatedly. Further days, repeated seeds, downstream tasks,
+and conditional uncertainty checks are needed for broader feasibility conclusions.

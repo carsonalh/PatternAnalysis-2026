@@ -1,7 +1,7 @@
 """Controlled TimeGAN training experiments for the initial midpoint jump.
 
 Each run starts from seed 0, uses a separately seeded data sampler, and keeps
-the original architecture, Wiener noise, losses, and stage budgets fixed.
+the fixed log-return features, architecture, noise, losses, and stage budgets.
 """
 
 import argparse
@@ -51,36 +51,23 @@ def noise_paths(batch, horizon, model, sequence_length):
 
 
 @torch.inference_mode()
-def complete(model, contexts, paths, chunk_size=1024):
+def complete(model, contexts, paths):
     """Continue an observed prefix using only generated history thereafter."""
-    if getattr(model, "price_representation", "level") == "return":
-        # Repeat the trained conditional task using only generated history.
-        # No validation observations or price offsets are inserted mid-forecast.
-        block = model.context_horizon
-        context_length = contexts.shape[1] - block
-        if context_length < 1:
-            raise ValueError("The continuation needs a nonempty context")
-        history = contexts[:, -context_length:]
-        outputs = []
-        for start in range(0, paths.shape[1] - 1, block):
-            noise = paths[:, start + 1:start + block + 1]
-            latent = model.embedder(history)[:, -1]
-            future = model.decoder(model.generator.continue_from(latent, noise))
-            outputs.append(future.cpu())
-            history = torch.cat((history, future), dim=1)[:, -context_length:]
-        return torch.cat(outputs, dim=1)
-    h = model.embedder(contexts)[:, -1]
-    horizon = paths.shape[1] - 1
-    features = torch.empty(len(contexts), horizon, model.model_config["feature_dims"])
-    buffer = h.new_empty(len(h), min(chunk_size, horizon), h.shape[-1])
-    for step in range(1, horizon + 1):
-        h = model.generator.cell(paths[:, step], h)
-        offset = (step - 1) % chunk_size
-        buffer[:, offset] = h
-        if step % chunk_size == 0 or step == horizon:
-            width = offset + 1
-            features[:, step - width:step] = model.decoder(buffer[:, :width]).cpu()
-    return features
+    if contexts.shape[1] < 2:
+        raise ValueError("The continuation needs at least two context events")
+    block = min(getattr(model, "context_horizon", 16), contexts.shape[1] - 1)
+    # Repeat the trained conditional task using only generated log-return features.
+    # No validation observations or price offsets are inserted mid-forecast.
+    context_length = contexts.shape[1] - block
+    history = contexts[:, -context_length:]
+    outputs = []
+    for start in range(0, paths.shape[1] - 1, block):
+        noise = paths[:, start + 1:start + block + 1]
+        latent = model.embedder(history)[:, -1]
+        future = model.decoder(model.generator.continue_from(latent, noise))
+        outputs.append(future.cpu())
+        history = torch.cat((history, future), dim=1)[:, -context_length:]
+    return torch.cat(outputs, dim=1)
 
 
 @torch.inference_mode()
@@ -108,7 +95,11 @@ No validation events are used for training, and normalization stays fixed.
             for sequence, anchor in zip(sequences, anchors)])
 
     generated = project(fake, np.repeat(initial, samples)).reshape(len(contexts), samples, horizon)
-    zero = project(complete(model, contexts, paths[:len(contexts)] * 0), initial)
+    zero_features = complete(model, contexts, paths[:len(contexts)] * 0)
+    zero = project(zero_features, initial)
+    log_returns = (fake[..., 0].numpy() * training.feature_std[0]
+                   + training.feature_mean[0]).reshape(len(contexts), samples, horizon)
+    zero_log_returns = zero_features[..., 0].numpy() * training.feature_std[0] + training.feature_mean[0]
     rises = generated[:, :, 63] - initial[:, None]
     endpoint_errors = generated[:, :, 63] - observed[:, 63, None]
     context_rows = pd.DataFrame({
@@ -122,6 +113,8 @@ No validation events are used for training, and normalization stays fixed.
     reconstruction = F.mse_loss(model(contexts), contexts).item()
     # The first row is the exact training/validation boundary from the notebook.
     metrics = {
+        "boundary_first_log_return_mean": float(log_returns[0, :, 0].mean()),
+        "boundary_first_log_return_std": float(log_returns[0, :, 0].std()),
         "boundary_first_event_change_dollars": float(generated[0, :, 0].mean() - initial[0]),
         "boundary_16_event_change_dollars": float(generated[0, :, 15].mean() - initial[0]),
         "boundary_16_event_std_dollars": float(generated[0, :, 15].std()),
@@ -140,6 +133,11 @@ No validation events are used for training, and normalization stays fixed.
         "boundary_observed_change_std_dollars": float(np.diff(np.r_[initial[0], observed[0, :64]]).std()),
     }
     curves = {
+        "observed_log_returns": (validation.features[:horizon, 0].numpy()
+                                 * training.feature_std[0] + training.feature_mean[0]).tolist(),
+        "generated_log_return_mean": log_returns[0].mean(axis=0).tolist(),
+        "generated_log_return_std": log_returns[0].std(axis=0).tolist(),
+        "zero_log_returns": zero_log_returns[0].tolist(),
         "starting_price_dollars": float(initial[0]),
         "observed": observed[0].tolist(),
         "generated_mean": generated[0].mean(axis=0).tolist(),
@@ -196,8 +194,8 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "model.pt").exists():
         raise FileExistsError(f"A completed run already exists at {directory}; choose another output.")
-    training = LOBSTERLevel10Dataset(True, price_representation=config.price_representation)
-    validation = LOBSTERLevel10Dataset(False, price_representation=config.price_representation)
+    training = LOBSTERLevel10Dataset(True)
+    validation = LOBSTERLevel10Dataset(False)
     # Independent sampler RNG keeps real batches identical even with extra G updates.
     loader = DataLoader(WindowDataset(training.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True,
@@ -231,6 +229,10 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     context = training.features[-config.sequence_length:][None]
     noisy = complete(model, context.repeat(3, 1, 1), paths)
     zero = complete(model, context, paths[:1] * 0)
+    # Keep decoder outputs in physical log-return units alongside integrated prices.
+    np.savez_compressed(directory / "completion_log_returns.npz",
+                        noisy=noisy[..., 0].numpy() * training.feature_std[0] + training.feature_mean[0],
+                        zero=zero[0, :, 0].numpy() * training.feature_std[0] + training.feature_mean[0])
     anchor = midpoint(training.books)[-1] * 10_000
     full_curves = np.stack([midpoint(training.feature_sequence_to_df(
         sequence, initial_midpoint=anchor)) for sequence in noisy])
@@ -242,7 +244,7 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("experiment", choices=EXPERIMENTS)
-    parser.add_argument("--output", type=Path, default=Path("runs/training_balance"))
+    parser.add_argument("--output", type=Path, default=Path("runs/log_return/training_balance"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--autoencoder-steps", type=int, default=1000)

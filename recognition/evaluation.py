@@ -234,7 +234,10 @@ def evaluate_timegan(model: TimeGAN, training: LOBSTERLevel10Dataset,
 
     losses = _validation_losses(model, real_validation)
     feature_comparison = compare_sequences(real_validation, generated)
-    real_books = _reconstruct_books(training, real_validation)
+    # Real windows retain their observed anchors; generated windows use the
+    # training reference price. Reanchoring real log returns would alter prices.
+    real_books = _select_nonoverlapping_windows(
+        torch.from_numpy(validation.books.to_numpy(copy=True)), sequence_length, samples)
     generated_books = _reconstruct_books(training, generated)
     book_comparison = BookComparison(
         real=book_statistics(real_books), generated=book_statistics(generated_books))

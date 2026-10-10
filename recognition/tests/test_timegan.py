@@ -34,11 +34,32 @@ def make_books(events=100):
 
 
 class DatasetTests(unittest.TestCase):
+    def test_midpoint_feature_is_log_return_without_a_representation_option(self):
+        books = make_books(20)
+        # Large alternating moves distinguish log(m_t / m_{t-1}) from m_t / m_{t-1} - 1.
+        offsets = np.tile([0, 1_000_000], 10)
+        books.iloc[:, 0::2] += offsets[:, None]
+        with patch("dataset.load_dfs", return_value=(books, pd.DataFrame())):
+            data = LOBSTERLevel10Dataset(normalize=False)
+        prices = (books.ASKp1 + books.BIDp1).to_numpy() / 2
+        log_returns = np.r_[0.0, np.log(prices[1:] / prices[:-1])]
+        np.testing.assert_allclose(data.features[:, 0], log_returns[:len(data)], rtol=1e-6)
+        arithmetic_returns = np.diff(prices[:len(data)]) / prices[:len(data) - 1]
+        self.assertFalse(np.allclose(data.features[1:, 0], arithmetic_returns))
+        self.assertEqual(data.feature_names[0], "log_midpoint_return")
+        with self.assertRaises(TypeError):
+            LOBSTERLevel10Dataset(price_representation="level")
+        with self.assertRaises(TypeError):
+            TrainingConfig(price_representation="level")
+        np.testing.assert_array_equal(
+            data.feature_sequence_to_df(data.features, initial_midpoint=prices[0]).to_numpy(),
+            books.iloc[:len(data)].to_numpy())
+
     def test_returns_round_trip_with_past_only_boundary_and_training_scaling(self):
         books = make_books()
         with patch("dataset.load_dfs", return_value=(books, pd.DataFrame())):
-            training = LOBSTERLevel10Dataset(True, price_representation="return")
-            validation = LOBSTERLevel10Dataset(False, price_representation="return")
+            training = LOBSTERLevel10Dataset(True)
+            validation = LOBSTERLevel10Dataset(False)
         prices = (books.ASKp1 + books.BIDp1).to_numpy() / 2
         returns = np.r_[0, np.diff(np.log(prices))]
         self.assertEqual(training.feature_names[0], "log_midpoint_return")
@@ -54,10 +75,10 @@ class DatasetTests(unittest.TestCase):
         features = np.zeros((3, 40))
         for anchor in (None, 0, -1, float("nan")):
             with self.subTest(anchor=anchor), self.assertRaises(ValueError):
-                features_to_order_book(features, price_representation="return", initial_midpoint=anchor)
+                features_to_order_book(features, initial_midpoint=anchor)
         # Zero returns preserve the anchor exactly when the spread is even.
         features[:, 1] = np.log1p(2)
-        books = features_to_order_book(features, price_representation="return", initial_midpoint=2_200_000)
+        books = features_to_order_book(features, initial_midpoint=2_200_000)
         np.testing.assert_array_equal((books.ASKp1 + books.BIDp1) / 2, np.full(3, 2_200_000))
     def test_windows_preserve_split_and_training_normalization(self):
         books = make_books()
@@ -67,7 +88,9 @@ class DatasetTests(unittest.TestCase):
         np.testing.assert_array_equal(training.feature_mean, validation.feature_mean)
         np.testing.assert_array_equal(training.feature_std, validation.feature_std)
         self.assertAlmostEqual(training.features[:, 0].mean().item(), 0, places=6)
-        self.assertGreater(validation.features[:, 0].mean().item(), 1)
+        prices = (books.ASKp1 + books.BIDp1).to_numpy() / 2
+        expected = (np.diff(np.log(prices))[84:] - training.feature_mean[0]) / training.feature_std[0]
+        np.testing.assert_allclose(validation.features[:, 0], expected, rtol=1e-6)
         train_windows = WindowDataset(training.features, 4)
         val_windows = WindowDataset(validation.features, 4)
         self.assertEqual(len(train_windows), 82)
@@ -76,7 +99,7 @@ class DatasetTests(unittest.TestCase):
         torch.testing.assert_close(val_windows[0], validation.features[:4])
         self.assertEqual(training.books.index[-1], 84)
         self.assertEqual(validation.books.index[0], 85)
-        reconstructed = validation.feature_sequence_to_df(val_windows[0])
+        reconstructed = validation.feature_sequence_to_df(val_windows[0], initial_midpoint=validation.initial_midpoint)
         np.testing.assert_array_equal(reconstructed.to_numpy(), books.iloc[85:89].to_numpy())
 
     def test_stride_short_splits_and_bounds(self):
@@ -93,8 +116,8 @@ class DatasetTests(unittest.TestCase):
     def test_projection_enforces_book_constraints(self):
         # Negative gap/size logs are clamped only at the export boundary.
         features = np.full((6, 40), -2.0)
-        features[:, 0] = np.log(2_200_000)
-        levels = features_to_order_book(features).to_numpy().reshape(6, 10, 4)
+        features[:, 0] = 0.0
+        levels = features_to_order_book(features, initial_midpoint=2_200_000).to_numpy().reshape(6, 10, 4)
         self.assertTrue((levels[:, :, 0] > levels[:, :, 2]).all())
         self.assertTrue((np.diff(levels[:, :, 0], axis=1) > 0).all())
         self.assertTrue((np.diff(levels[:, :, 2], axis=1) < 0).all())
@@ -249,7 +272,7 @@ class TrainingTests(unittest.TestCase):
         for horizon in (0, -1, 1.5, 64):
             with self.subTest(horizon=horizon), self.assertRaises(ValueError):
                 TrainingConfig(context_loss_weight=1, context_horizon=horizon)
-        for option in ({"noise_kind": "invalid"}, {"price_representation": "invalid"},
+        for option in ({"noise_kind": "invalid"},
                        {"price_moment_weight": -1}, {"price_moment_weight": float("nan")}):
             with self.subTest(option=option), self.assertRaises(ValueError):
                 TrainingConfig(**option)
@@ -275,11 +298,11 @@ class TrainingTests(unittest.TestCase):
         future = self.model.decoder(self.model.generator.continue_from(context, noise[:, 1:4]))
         error = (future[..., 0] - self.x[:, 3:, 0]).cumsum(dim=1)
         expected = (error / torch.arange(1, 4).sqrt()).square().mean()
-        torch.testing.assert_close(context_price_loss(self.model, self.x, noise, 3, "return"), expected)
+        torch.testing.assert_close(context_price_loss(self.model, self.x, noise, 3), expected)
 
     def test_return_moment_loss_updates_only_generator(self):
         trainer = TimeGANTrainer(self.model, TrainingConfig(
-            sequence_length=6, price_representation="return", noise_kind="wiener_increments",
+            sequence_length=6, noise_kind="wiener_increments",
             context_horizon=2, context_loss_weight=1, price_moment_weight=10))
         metrics = trainer.generator_step(self.x)
         self.assertGreater(metrics["g_price_moments"], 0)
@@ -289,7 +312,6 @@ class TrainingTests(unittest.TestCase):
 
     def test_return_completions_reencode_only_the_generated_past(self):
         model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
-        model.price_representation = "return"
         model.context_horizon = 2
         contexts = torch.randn(4, 6, 3)
         paths, _ = generate_wiener_paths(4, 6, 7)
@@ -305,7 +327,7 @@ class TrainingTests(unittest.TestCase):
 
     def test_midpoint_returns_follow_decoder_in_sampling_and_completion(self):
         model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
-        model.price_representation, model.noise_kind, model.context_horizon = "return", "wiener_increments", 2
+        model.noise_kind, model.context_horizon = "wiener_increments", 2
         model.sequence_length = 6
         contexts = torch.randn(4, 6, 3)
         paths = noise_paths(4, 9, model, 6)
@@ -324,9 +346,9 @@ class TrainingTests(unittest.TestCase):
 
     def test_rejects_checkpoints_that_replace_the_decoder_midpoint(self):
         with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
-            data = LOBSTERLevel10Dataset(price_representation="return")
+            data = LOBSTERLevel10Dataset()
         model = TimeGAN(latent_dims=8, noise_dims=7)
-        config = TrainingConfig(price_representation="return", noise_kind="wiener_increments")
+        config = TrainingConfig(noise_kind="wiener_increments")
         with tempfile.TemporaryDirectory() as directory:
             original_path, altered_path = Path(directory) / "original.pt", Path(directory) / "altered.pt"
             save_checkpoint(original_path, model, config, data)
@@ -345,8 +367,8 @@ class TrainingTests(unittest.TestCase):
 
     def test_return_decoder_checkpoint_round_trip(self):
         with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
-            data = LOBSTERLevel10Dataset(price_representation="return")
-        config = TrainingConfig(price_representation="return", noise_kind="wiener_increments")
+            data = LOBSTERLevel10Dataset()
+        config = TrainingConfig(noise_kind="wiener_increments")
         model = TimeGAN(latent_dims=8, noise_dims=7)
         TimeGANTrainer(model, config)
         with tempfile.TemporaryDirectory() as directory:
@@ -354,11 +376,29 @@ class TrainingTests(unittest.TestCase):
             save_checkpoint(path, model, config, data)
             loaded, checkpoint = load_checkpoint(path)
             self.assertEqual(checkpoint["feature_names"][0], "log_midpoint_return")
+            self.assertEqual(checkpoint["price_representation"], "log_return")
+            self.assertNotIn("price_representation", checkpoint["training_config"])
             self.assertEqual(loaded.noise_kind, "wiener_increments")
             torch.manual_seed(6)
             expected = generate_features(model, 2, 64)
             torch.manual_seed(6)
             torch.testing.assert_close(generate_features(loaded, 2, 64), expected)
+
+            # Historical checkpoints used 'return' for exactly the same log-return feature.
+            checkpoint["price_representation"] = "return"
+            checkpoint["training_config"]["price_representation"] = "return"
+            torch.save(checkpoint, path)
+            legacy, _ = load_checkpoint(path)
+            self.assertEqual(load_checkpoint(path)[1]["price_representation"], "log_return")
+            contexts = data.features[-64:][None]
+            paths = noise_paths(1, 20, loaded, 64)
+            torch.testing.assert_close(complete(legacy, contexts, paths), complete(loaded, contexts, paths))
+
+            checkpoint["feature_names"][0] = "log_midpoint"
+            checkpoint["price_representation"] = "level"
+            torch.save(checkpoint, path)
+            with self.assertRaisesRegex(ValueError, "not trained on midpoint log returns"):
+                load_checkpoint(path)
 
     def test_context_loss_has_no_future_conditioning_and_updates_only_generator(self):
         config = TrainingConfig(sequence_length=6, context_horizon=2, context_loss_weight=10)
@@ -415,6 +455,7 @@ class TrainingTests(unittest.TestCase):
         with patch("dataset.load_dfs", return_value=(make_books(), pd.DataFrame())):
             data = LOBSTERLevel10Dataset()
         model = TimeGAN()
+        TimeGANTrainer(model, self.config)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
             save_checkpoint(path, model, self.config, data)
@@ -426,7 +467,8 @@ class TrainingTests(unittest.TestCase):
                 actual = generate_features(loaded, 2, 6)
                 torch.testing.assert_close(actual, expected)
                 book = features_to_order_book(actual[0], checkpoint["feature_mean"].numpy(),
-                                              checkpoint["feature_std"].numpy())
+                                              checkpoint["feature_std"].numpy(),
+                                              initial_midpoint=checkpoint["reference_midpoint"])
                 self.assertEqual(book.shape, (6, 40))
 
     def test_temporal_learning_on_autoregressive_sequences(self):
@@ -469,6 +511,9 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(report.validation_windows, 3)
         self.assertEqual(report.unprojected_feature_statistics.real.mean.shape, (40,))
         self.assertGreater(report.projected_book_statistics.generated.spread_mean_dollars, 0)
+        # Log-return decoding must not move real validation windows to the training median.
+        observed_books = torch.from_numpy(validation.books.iloc[:12].to_numpy(copy=True)).reshape(3, 4, 40)
+        self.assertEqual(asdict(report.projected_book_statistics.real), asdict(book_statistics(observed_books)))
         saved = json.loads(json.dumps(asdict(report), default=torch.Tensor.tolist, allow_nan=False))
         self.assertEqual(len(saved["unprojected_feature_statistics"]["real"]["mean"]), 40)
         self.assertIsInstance(saved["unprojected_feature_statistics"]["absolute_errors"]["mean"], float)

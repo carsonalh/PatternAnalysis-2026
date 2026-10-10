@@ -1,4 +1,4 @@
-"""Test a decoded midpoint loss on 16-event context-conditioned continuations.
+"""Test cumulative log-return loss on 16-event context-conditioned continuations.
 
 Compare against discriminator_1e-4_seed_0 from the training-balance experiment.
 Architecture, data order, noise, warm-ups, and training budgets are identical.
@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weight", type=float, required=True)
     parser.add_argument("--horizon", type=int, default=16)
-    parser.add_argument("--output", type=Path, default=Path("runs/context_loss"))
+    parser.add_argument("--output", type=Path, default=Path("runs/log_return/context_loss"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--autoencoder-steps", type=int, default=1000)

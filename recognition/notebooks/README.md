@@ -1,101 +1,91 @@
 # Notebook guide
 
-Read these four chapters in order. Their filenames are retained so existing
-links to the main notebooks still work. Each chapter also runs independently
-from `recognition/` or `recognition/notebooks/` with the project environment.
-Executed outputs are included for reading without retraining.
+All four chapters use one fixed feature definition: midpoint log return plus
+39 spread, gap, and order-size features. The model's midpoint input and output
+are always `log(m_t / m_{t-1})`, standardized using training events only.
+There is no selectable price format. Prices are recovered only by integrating
+predicted log returns from an explicit preceding midpoint.
 
 | Chapter | Notebook | Main question |
 |---|---|---|
-| 1 | [Data and features](order_book_analysis.ipynb) | What book structure and data transformations must generation preserve? |
-| 2 | [Baseline TimeGAN](lobster_timegan.ipynb) | Can the model reconstruct real books and generate plausible sequences? |
-| 3 | [Price dynamics experiments](lobster_timegan_return_dynamics.ipynb) | What causes the initial drift, and which corrections address it? |
-| 4 | [Generation evaluation](lobster_timegan_return_distributions.ipynb) | How do the price-level and return TimeGAN compare with real data beyond the price reset? |
+| 1 | [Data and features](order_book_analysis.ipynb) | Are the fixed log-return features and split boundary correct? |
+| 2 | [TimeGAN training and predictions](lobster_timegan.ipynb) | Can TimeGAN reconstruct log returns and continue the training history? |
+| 3 | [Log-return dynamics](lobster_timegan_return_dynamics.ipynb) | How do noise and context supervision affect return predictions? |
+| 4 | [Generation evaluation](lobster_timegan_return_distributions.ipynb) | Do generated log returns and book structure match real sequences? |
+
+Each chapter runs independently from `recognition/` or `recognition/notebooks/`.
+Executed outputs are included for reading without rerunning training.
 
 ## Running the notebooks
-
-Install the dependencies and start Jupyter from the project directory:
 
 ```sh
 uv sync
 make run-jupyter
 ```
 
-Select a kernel using the project environment; `make install-kernel` registers
-one if needed. Chapter 1 loads the LOBSTER sample, downloading it into `data/`
-when it is not already cached. Other chapters need the saved models and reports
-listed below. They do not silently retrain missing experiments.
+Use a kernel with the project environment; `make install-kernel` registers one
+if needed. Chapter 1 loads the cached LOBSTER sample or downloads it into `data/`.
+Chapters 2–4 load the following log-return models; missing experiments raise an
+error instead of loading old price-level weights.
 
-| Chapter | Required local artifacts |
+| Chapter | Required artifacts |
 |---|---|
-| 1 | LOBSTER sample in `data/`, or access to download it |
-| 2 | `runs/timegan/model.pt` and `losses.csv`; set `LOAD_EXISTING = False` for an in-memory exploratory run |
-| 3 | Original baseline; four `runs/training_balance/` settings; context weights 10/100 under `runs/context_loss/`; return weights 1/10, reset control, and previous-level control under `runs/return_price/` |
-| 4 | Original baseline and `runs/return_price/returns_context_1_moments_10_seed_0/model.pt` |
+| 2 | `runs/log_return/returns_context_1_moments_10_seed_0/model.pt` and `losses.csv` |
+| 3 | Both context weights 1/10 under `runs/log_return/`, with diagnostics, snapshots, `long_boundary.json`, `completion_log_returns.npz`, and `completion_midpoints.npz` |
+| 4 | Both context-weight checkpoints under `runs/log_return/` |
 
-Chapter 3 reads final diagnostics (or the final numbered snapshot), intermediate
-`snapshots.csv`, the return controls' `long_boundary.json`, and the return TimeGAN's
-`completion_midpoints.npz`. Missing 16-event metrics in older original/balance
-reports are recomputed from their matching checkpoints without overwriting
-those reports. The short noise ablation is recomputed with 32 paired paths.
+Chapter 2 allows a short in-memory training run with `LOAD_EXISTING = False`.
+It uses the same fixed log-return features and loss/noise settings and does not
+replace saved experiments. Its reconstruction examples use each real window's
+preceding midpoint. Its prediction chart shows decoder log returns directly,
+then their integrated prices starting from the last training midpoint.
 
-Chapter 4 samples fresh unconditional windows from both checkpoints, decodes
-each independently, and runs three small next-event predictors. It fits no new
-TimeGAN and writes no run artifacts. Its predictors compare
-only the common 39 structure features, keeping log prices and log returns out
-of the same score.
+Chapter 3 compares context-loss weights within the same log-return space and
+recomputes a paired 32-path inference-noise ablation. It records the first
+predicted log return and integrated price change at the training boundary.
+It does not insert validation prices or remove residual drift.
+
+Chapter 4 samples fresh unconditional windows and runs small next-event
+predictors. Every predictor includes all 40 fixed features, so its midpoint
+target is always log return. Histograms of projected book changes stay within
+each independent window. Prices restart from the training median between windows.
 
 ## Reproducing training and reports
 
-The existing experiment scripts preserve the original settings and saved
-evidence. Run from the project directory, in this dependency order:
+Run from the project directory, in this order:
 
 ```sh
-uv run python main.py
-
-uv run python training_balance_experiment.py baseline
-uv run python training_balance_experiment.py discriminator_1e-4
-uv run python training_balance_experiment.py discriminator_3e-5
-uv run python training_balance_experiment.py generator_twice
-
-uv run python context_loss_experiment.py --weight 10
-uv run python context_loss_experiment.py --weight 100
-
-uv run python return_price_experiment.py --weight 1
-uv run python return_price_experiment.py --weight 10
+uv run python return_price_experiment.py --weight 1 --threads 4
+uv run python return_price_experiment.py --weight 10 --threads 2
 uv run python return_price_report.py
 ```
 
-The experiment scripts reject completed output directories;
-reuse their existing outputs for this local study. New training may differ
-from historical runs with another environment or device. To compare new runs,
-choose separate output locations and update the notebook paths and report
-script references consistently. `return_price_report.py` uses the default
-locations, copies the context-weight-100 reference into its control folders,
-and regenerates their reports.
+Each model uses 1,000 reconstruction, 1,000 transition, and 5,000 joint updates,
+seed 0, 64-event windows, stationary Wiener increments, discriminator rate
+`1e-4`, and log-return moment weight 10. Context supervision predicts 16 events
+after 48 real prefix events. The CPU thread count is recorded in each run's
+`run.json`; different thread counts can affect floating-point training results.
 
-`data/` and `runs/` are ignored by Git. Preserve them separately: committed
-notebook figures are readable evidence, but cannot replace the checkpoints,
-normalization, and diagnostics needed for reproduction.
+Completed directories are protected against accidental retraining. To reproduce
+into new locations, pass a different `--output` to training and the corresponding
+`--root` to the report command, then update the notebook paths consistently.
+The report computes short forecasts, 1,024-event diagnostics, and full-validation
+predicted log-return and integrated price paths. Every forecast uses generated
+history after the initial real prefix.
 
-## How earlier notebooks were consolidated
+`data/` and `runs/` are ignored by Git. Preserve them separately: saved notebook
+figures cannot replace checkpoints, feature normalization, and diagnostics.
 
-| Earlier notebook | Destination |
-|---|---|
-| `lobster_statistics`, `lobster_preprocessing` | Chapter 1: statistics, feature explanation, and conversion checks |
-| `lobster_autoencoder` | Chapter 2: reconstruction checks using the current TimeGAN |
-| `wiener_process` | Chapter 2: path-versus-increment explanation |
-| `lobster_timegan_noise_ablation`, `lobster_timegan_training_balance`, `lobster_timegan_context_loss` | Chapter 3: controlled comparisons, intermediate training evidence, and limitations |
-| `embedding_experiment`, `volatility` | Removed learning exercises; prior versions remain in Git history |
+## Historical evidence and limits
 
-The failed controls remain part of the research story. TimeGAN's decoder
-generates midpoint returns together with the other 39 features; prices follow
-by accumulating those returns. Any remaining drift is a generation error.
-No external price process or fixed drift is used. This one-day,
-one-training-seed study uses validation throughout development. Interpret
-chapter 4's structure and temporal checks before drawing feasibility conclusions.
+The previous price-level checkpoints, optimizer-balance sweeps, and noise-reset
+controls remain under their original `runs/` paths as historical evidence. They
+are excluded from every current notebook prediction. The checkpoint loader
+rejects price-level feature names rather than interpreting old weights as
+log-return weights. Historical notebooks can be recovered from Git history.
 
-The removed external-price experiment's saved artifacts remain under `runs/`
-for historical traceability, but are excluded from these notebooks and cannot
-be sampled through `predict.py`. Both displayed generation variants use only
-TimeGAN's generator and decoder.
+All generated features come from TimeGAN's decoder. No external price process
+or fixed drift is applied. A learned log-return bias can accumulate in long
+rollouts and remains a generation error. This one-day, one-training-seed-per-setting
+study uses validation during development. Inspect book structure and temporal
+checks before extending its feasibility conclusions.

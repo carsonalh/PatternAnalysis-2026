@@ -1,11 +1,3 @@
-"""Direct-recurrence TimeGAN: reconstruction, transition, then joint training.
-
-Objectives follow TimeGAN equations (7)-(11), using non-saturating BCE for G:
-https://proceedings.neurips.cc/paper/2019/file/c9efe5f26cd17ba6216bbe2a7d26d490-Paper.pdf
-There is no static branch or separate supervisor network. Optional midpoint
-log-return context and moment losses extend the joint generator objective.
-"""
-
 from dataclasses import asdict, dataclass
 from itertools import chain
 import logging
@@ -423,11 +415,20 @@ def main():
     save_checkpoint(args.output / "model.pt", model, config, train_data)
     pd.DataFrame(history).to_csv(args.output / "losses.csv", index=False)
     if not args.skip_evaluation:
+        from skimage.metrics import structural_similarity as ssim
         validation_data = LOBSTERLevel10Dataset(train=False, sampling_interval_seconds=args.sampling_interval_seconds)
         report, generated = evaluate_timegan(model, train_data, validation_data,
                                              sequence_length=config.sequence_length,
                                              samples=args.evaluation_samples,
                                              predictor_steps=args.predictor_steps, seed=args.seed)
+        depth_scores = []
+        for i, fake in enumerate(generated[:len(validation_data) // config.sequence_length]):
+            real = validation_data.books.iloc[i * config.sequence_length:(i + 1) * config.sequence_length]
+            fake = train_data.feature_sequence_to_df(fake)
+            for side in (1, 3):
+                a, b = (book.iloc[:, side::4].to_numpy(dtype=float).T for book in (real, fake))
+                depth_scores.append(ssim(a, b, data_range=max(np.ptp(a), 1), win_size=3 if a.shape[1] > 2 else 1, use_sample_covariance=False))
+        logger.info("Depth SSIM (unpaired windows, mean bid/ask levels x time)=%.5f", np.mean(depth_scores))
         (args.output / "evaluation.json").write_text(
             json.dumps(asdict(report), default=torch.Tensor.tolist, indent=2, allow_nan=False) + "\n")
         np.save(args.output / "generated_features.npy", generated.numpy())

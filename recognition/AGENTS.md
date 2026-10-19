@@ -16,3 +16,13 @@ clarity of the code are important where possible.
 The project does not use regular git flow. Making a change in the worktree and
 committing straight to `topic-recognition` is fine, since there is only one
 person working on this branch.
+
+## General Response Criteria
+
+Your responses should all be ultra-concise, unless specifically requested
+otherwise. Keep textual responses under three sentences, and when making a
+list, each item should be no more than two sentences or about 50 words in
+total. When generating code, most prompts should have about 5 lines of code
+changed, or 30 lines at the very most. This is all to keep the user from being
+confused by your output, so it's important that you strictly adhere to these
+brevity guidelines.

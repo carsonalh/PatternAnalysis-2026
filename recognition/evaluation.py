@@ -1,5 +1,3 @@
-"""Compare real and generated features, reconstructed books, and predictions."""
-
 from dataclasses import dataclass
 
 import torch

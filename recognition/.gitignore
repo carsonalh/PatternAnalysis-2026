@@ -3,5 +3,5 @@ __pycache__
 
 data/
 notebooks/data/
-notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
 runs/

@@ -76,6 +76,78 @@ history after the initial real prefix.
 `data/` and `runs/` are ignored by Git. Preserve them separately: saved notebook
 figures cannot replace checkpoints, feature normalization, and diagnostics.
 
+## Context and latent-loss weight experiments
+
+`loss_weight_experiment.py` retrains the same model while changing the context
+penalty and the generator's latent-supervision penalty (`eta`). The embedder's
+penalty (`lam=1`), return-moment weight 10, features, noise, and training budgets
+stay fixed. For example:
+
+```sh
+uv run python loss_weight_experiment.py --context-weight 0.1 --latent-weight 1 --output runs/log_return/loss_weights
+uv run python loss_weight_report.py --root runs/log_return/loss_weights --reference runs/log_return/returns_context_1_moments_10_seed_0
+```
+
+These commands default to CUDA; pass `--device cpu` for CPU execution. Compare
+new settings with a baseline retrained on the same device: CPU and CUDA random
+streams and numerical results differ. Each run retains three full-validation
+paths with fixed noise draws. The report saves the notebook's two-panel plots,
+`comparison.csv`, and 32 conditional futures at each of eight starting contexts.
+Return volatility is measured before tick rounding; drift and variation between
+paths are reported separately. Validation-based selection is exploratory.
+
+## One-second order-book sampling
+
+The one-second experiment uses the latest book at each whole second, including
+quiet seconds, and recomputes returns after sampling. It preserves the original
+event-based split time and fits normalization only on training snapshots.
+There are 23,399 snapshots: 21,141 training and 2,258 validation. A 64-row window
+therefore has one-second steps; the conditional horizon is 16 seconds.
+
+```sh
+uv run python loss_weight_experiment.py --context-weight 0.1 --latent-weight 10 --sampling-interval-seconds 1 --output runs/log_return/one_second_reproduction
+uv run python loss_weight_report.py --root runs/log_return/one_second_reproduction --device cpu
+```
+
+Repeat training with `(context, latent)` weights `(0.1, 10)`, `(0.3, 10)`,
+`(1, 10)`, `(0.03, 10)`, `(0.1, 1)`, and `(0.3, 1)` to reproduce the six-run
+comparison. Training defaults to CUDA; the report above uses CPU, matching the
+saved three-path rollouts. The report writes individual notebook-style figures
+and a comparison of all futures with shared axes. Completed runs are protected;
+choose a new output directory when retraining.
+
+The completed results and session recovery details are in
+[`runs/log_return/one_second_20261010/README.md`](../runs/log_return/one_second_20261010/README.md).
+The sampled book export includes each snapshot's original event index and time.
+The existing four notebooks retain their original event-based experiments.
+
+## Balanced volatility and final-price spread
+
+To reproduce the improved one-second forecast in a fresh directory:
+
+```sh
+uv run python loss_weight_experiment.py --context-weight 0.01 --latent-weight 10 --moment-weight 100 --drift-weight 100 --sampling-interval-seconds 1 --output runs/log_return/balanced_reproduction
+uv run python refine_loss_weights.py runs/log_return/balanced_reproduction/context_0.01_latent_10_moments_100_drift_100_seed_0/model.pt --output runs/log_return/balanced_reproduction/refined --steps 1000 --moment-weight 100 --drift-weight 1000 --learning-rate 1e-5
+uv run python terminal_price_report.py --root runs/log_return/balanced_reproduction --checkpoint runs/log_return/balanced_reproduction/refined/model.pt --samples 1024 --seed 17
+```
+
+These commands default to CUDA. The final pass updates only the generator,
+using a smaller learning rate after the decoder has stopped changing. Its
+conditional drift penalty matches a zero physical log return, expressed using
+training normalization, and averages paired Gaussian innovations to reduce
+noise in the estimated expected return. All price paths remain integrated
+decoder outputs. The penalty is a neutral-drift modeling prior.
+
+The terminal report observes the first validation snapshot as the starting
+context and forecasts the remaining 2,257 seconds. It reports return SD,
+median error and its Monte Carlo confidence interval, endpoint dispersion,
+upward-path share, and the fitted log-price CDF distance. It draws three paths,
+ensemble intervals, the terminal histogram, and a log-price normal Q–Q plot.
+Only the histogram overlay is fitted; generated prices are not transformed.
+
+Selected results, the search history, and independent-noise checks are in
+[`runs/log_return/one_second_balance_20261010/README.md`](../runs/log_return/one_second_balance_20261010/README.md).
+
 ## Historical evidence and limits
 
 The previous price-level checkpoints, optimizer-balance sweeps, and noise-reset

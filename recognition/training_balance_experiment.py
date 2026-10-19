@@ -152,7 +152,8 @@ class ExperimentTrainer(TimeGANTrainer):
     """Evaluate snapshots without advancing the training random-number stream."""
 
     def __init__(self, model, config, training, validation, directory):
-        super().__init__(model, config)
+        super().__init__(model, config, return_mean=training.feature_mean[0],
+                         return_std=training.feature_std[0])
         self.training = training
         self.validation = validation
         self.directory = directory
@@ -168,7 +169,9 @@ class ExperimentTrainer(TimeGANTrainer):
             step = self.joint_iteration
             was_training = self.model.training
             self.model.eval()
-            with torch.random.fork_rng(devices=[]):
+            device = next(self.model.parameters()).device
+            devices = [device.index] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
                 measured, curves, contexts = diagnostics(
                     self.model, self.training, self.validation, self.config)
             self.model.train(was_training)
@@ -184,7 +187,8 @@ class ExperimentTrainer(TimeGANTrainer):
         return metrics
 
 
-def run_experiment(experiment, config, output, seed=0, threads=4):
+def run_experiment(experiment, config, output, seed=0, threads=4, device="cpu",
+                   *, sampling_interval_seconds=None):
     """Shared fresh-training protocol for loss and optimizer comparisons."""
     torch.set_num_threads(threads)
     torch.manual_seed(seed)
@@ -194,13 +198,13 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "model.pt").exists():
         raise FileExistsError(f"A completed run already exists at {directory}; choose another output.")
-    training = LOBSTERLevel10Dataset(True)
-    validation = LOBSTERLevel10Dataset(False)
+    training = LOBSTERLevel10Dataset(True, sampling_interval_seconds=sampling_interval_seconds)
+    validation = LOBSTERLevel10Dataset(False, sampling_interval_seconds=sampling_interval_seconds)
     # Independent sampler RNG keeps real batches identical even with extra G updates.
     loader = DataLoader(WindowDataset(training.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True,
                         generator=torch.Generator().manual_seed(seed))
-    model = TimeGAN()
+    model = TimeGAN().to(device)
     trainer = ExperimentTrainer(model, config, training, validation, directory)
     started = time.monotonic()
     history = trainer.fit(loader, log_every=500)
@@ -213,17 +217,25 @@ def run_experiment(experiment, config, output, seed=0, threads=4):
     contexts.to_csv(directory / "contexts_final.csv", index=False)
     metadata = {
         "experiment": experiment, "seed": seed, "threads": threads,
+        "device": str(next(model.parameters()).device),
+        "torch_version": str(torch.__version__),
         "training_config": asdict(config), "model_config": model.model_config,
+        "data_config": training.data_config,
+        "training_rows": len(training), "validation_rows": len(validation),
+        "split_time_seconds": training.split_time_seconds,
         "training_seconds": elapsed,
-        "joint_generator_updates": config.joint_steps * config.generator_updates,
-        "joint_discriminator_updates": config.joint_steps,
-        "joint_embedding_updates": config.joint_steps,
+        "joint_generator_updates": trainer.update_counts["generator"],
+        "joint_discriminator_updates": trainer.update_counts["discriminator"],
+        "joint_discriminator_skipped": trainer.update_counts["discriminator_skipped"],
+        "joint_embedding_updates": trainer.update_counts["embedding"],
         "evaluation_contexts": 8, "evaluation_samples_per_context": 32,
         "evaluation_seed": EVALUATION_SEED,
     }
     (directory / "run.json").write_text(json.dumps(metadata, indent=2) + "\n")
     # Keep the original full-validation chart and the deterministic comparison.
     torch.set_num_threads(1)
+    # Small three-path rollouts run efficiently on CPU and use paired CPU noise.
+    model.to("cpu")
     horizon = len(validation)
     paths = noise_paths(3, horizon, model, config.sequence_length)
     context = training.features[-config.sequence_length:][None]

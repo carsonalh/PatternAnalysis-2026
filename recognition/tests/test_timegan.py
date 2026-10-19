@@ -11,11 +11,13 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from dataset import LOBSTERLevel10Dataset, ORDER_BOOK_COLUMNS, WindowDataset, features_to_order_book
+from dataset import (LOBSTERLevel10Dataset, ORDER_BOOK_COLUMNS, WindowDataset,
+                     features_to_order_book, sample_order_book)
 from evaluation import book_statistics, compare_sequences, evaluate_timegan, next_step_mae, sequence_statistics
 from modules import TimeGAN
 from predict import generate_wiener_paths, generate_features, load_checkpoint
-from train import TimeGANTrainer, TrainingConfig, context_price_loss, save_checkpoint, supervised_loss
+from train import (TimeGANTrainer, TrainingConfig, conditional_drift_loss,
+                   context_price_loss, save_checkpoint, supervised_loss)
 from training_balance_experiment import complete, noise_paths
 
 # Small recurrent tests are substantially faster without many CPU worker threads.
@@ -252,7 +254,7 @@ class TrainingTests(unittest.TestCase):
              patch.object(trainer, "generator_step", wraps=trainer.generator_step) as g, \
              patch.object(trainer, "embedding_step", wraps=trainer.embedding_step) as e:
             metrics = trainer.joint_step(self.x)
-        self.assertEqual((d.call_count, g.call_count, e.call_count), (1, 2, 1))
+        self.assertEqual((d.call_count, g.call_count, e.call_count), (1, 2, 2))
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
         self.assertEqual(next(iter(trainer.opt_G.state.values()))["step"].item(), 2)
         self.assertEqual(next(iter(trainer.opt_D.state.values()))["step"].item(), 1)
@@ -309,6 +311,39 @@ class TrainingTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in self.model.decoder.parameters()))
         self.assertTrue(all(p.grad is None for p in self.model.embedder.parameters()))
         self.assertGreater(self.model.generator.cell.weight_hh.grad.abs().sum().item(), 0)
+
+    def test_conditional_drift_prior_uses_physical_zero_and_only_past(self):
+        config = TrainingConfig(sequence_length=6, context_horizon=2, conditional_drift_weight=10)
+        trainer = TimeGANTrainer(self.model, config, return_mean=0.2, return_std=2)
+        self.assertAlmostEqual(trainer.zero_return, -0.1)
+        trainer.train_only(self.model.generator)
+        noise, _ = trainer._noise(self.x)
+        context = self.model.embedder(self.x[:, :4])[:, -1].detach()
+        paired = torch.stack((noise[:, 1:3], -noise[:, 1:3]), dim=1).flatten(0, 1)
+        future = self.model.decoder(self.model.generator.continue_from(
+            context.repeat_interleave(2, dim=0), paired))[..., 0].reshape(4, 2, 2)
+        expected = ((future.mean(dim=1) + 0.1).cumsum(dim=1)
+                    / torch.arange(1, 3).sqrt()).square().mean()
+        actual = conditional_drift_loss(self.model, self.x, noise, 2, trainer.zero_return)
+        torch.testing.assert_close(actual, expected)
+        changed = self.x.clone()
+        changed[:, -2:] += 100
+        torch.testing.assert_close(actual, conditional_drift_loss(
+            self.model, changed, noise, 2, trainer.zero_return))
+        metrics = trainer.generator_step(self.x)
+        self.assertIn("g_conditional_drift", metrics)
+        self.assertTrue(all(p.grad is None for p in self.model.decoder.parameters()))
+        self.assertTrue(all(p.grad is None for p in self.model.embedder.parameters()))
+        self.assertGreater(self.model.generator.cell.weight_hh.grad.abs().sum().item(), 0)
+
+    def test_conditional_drift_configuration_rejects_invalid_weights_and_horizon(self):
+        for weight in [-1, float("nan"), float("inf")]:
+            with self.subTest(weight=weight), self.assertRaises(ValueError):
+                TrainingConfig(conditional_drift_weight=weight)
+        with self.assertRaises(ValueError):
+            TrainingConfig(sequence_length=6, context_horizon=6, conditional_drift_weight=1)
+        with self.assertRaises(ValueError):
+            TimeGANTrainer(self.model, return_std=0)
 
     def test_return_completions_reencode_only_the_generated_past(self):
         model = TimeGAN(feature_dims=3, latent_dims=8, noise_dims=7)
@@ -428,7 +463,7 @@ class TrainingTests(unittest.TestCase):
         with patch("train.context_price_loss", side_effect=AssertionError):
             metrics = disabled.generator_step(self.x)
         rng_after = torch.get_rng_state()
-        self.assertNotIn("g_context_price", metrics)
+        self.assertEqual(metrics["g_context_price"], 0)
         self.assertAlmostEqual(metrics["generator"], metrics["adversarial"] + 10 * metrics["g_supervised"], places=6)
         torch.set_rng_state(rng_before)
         generate_wiener_paths(4, 6, 7)
@@ -544,6 +579,69 @@ class EvaluationTests(unittest.TestCase):
         second = next_step_mae(windows, windows, steps=3, seed=2)
         self.assertEqual(first, second)
         self.assertTrue(np.isfinite(first))
+
+
+class ClockSamplingTests(unittest.TestCase):
+    def setUp(self):
+        self.books = make_books(20)
+        self.messages = pd.DataFrame({"time": [
+            0.2, 0.7, 1.0, 1.0, 1.4, 2.6, 3.2, 3.6, 3.8, 4.2,
+            4.8, 5.2, 6.3, 6.7, 7.1, 7.3, 7.7, 8.2, 9.2, 10.2]})
+
+    def test_previous_tick_sampling_handles_ties_and_quiet_seconds(self):
+        books = make_books(5)
+        messages = pd.DataFrame({"time": [0.2, 0.9, 1.0, 1.0, 3.2]})
+        sampled, times, source = sample_order_book(books, messages, 1)
+        np.testing.assert_array_equal(times, [1, 2, 3])
+        np.testing.assert_array_equal(source, [3, 3, 3])
+        np.testing.assert_array_equal(sampled.to_numpy(), books.iloc[[3, 3, 3]].to_numpy())
+        self.assertTrue(np.all(messages.time.to_numpy()[source] <= times))
+
+    def test_preserves_cutoff_and_recomputes_returns_after_sampling(self):
+        with patch("dataset.load_dfs", return_value=(self.books, self.messages)):
+            training = LOBSTERLevel10Dataset(True, sampling_interval_seconds=1)
+            validation = LOBSTERLevel10Dataset(False, sampling_interval_seconds=1)
+        self.assertEqual(training.split_time_seconds, 8.2)
+        np.testing.assert_array_equal(training.timestamps, np.arange(1, 9))
+        np.testing.assert_array_equal(validation.timestamps, [9, 10])
+        sampled = self.books.iloc[[3, 4, 5, 8, 10, 11, 13, 16, 17, 18]]
+        prices = (sampled.ASKp1.to_numpy() + sampled.BIDp1.to_numpy()) / 2
+        expected = np.r_[0, np.diff(np.log(prices))]
+        features = torch.cat((training.features, validation.features)).numpy()
+        actual = features[:, 0] * training.feature_std[0] + training.feature_mean[0]
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-11)
+        self.assertAlmostEqual(training.feature_mean[0], expected[:8].mean())
+        np.testing.assert_array_equal(training.feature_mean, validation.feature_mean)
+        np.testing.assert_array_equal(
+            validation.feature_sequence_to_df(validation.features,
+                initial_midpoint=validation.initial_midpoint).to_numpy(), sampled.iloc[8:].to_numpy())
+        altered = self.books.copy()
+        altered.iloc[17:, 0::2] += 1_000_000
+        with patch("dataset.load_dfs", return_value=(altered, self.messages)):
+            unchanged = LOBSTERLevel10Dataset(True, sampling_interval_seconds=1)
+        np.testing.assert_array_equal(training.feature_mean, unchanged.feature_mean)
+        np.testing.assert_array_equal(training.feature_std, unchanged.feature_std)
+
+    def test_sampling_rejects_invalid_intervals_and_unordered_events(self):
+        for interval in [0, -1, float("nan"), float("inf"), 100]:
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                sample_order_book(self.books, self.messages, interval)
+        with self.assertRaises(ValueError):
+            sample_order_book(self.books, self.messages.iloc[::-1], 1)
+        with self.assertRaises(ValueError):
+            sample_order_book(self.books, self.messages.iloc[:-1], 1)
+
+    def test_checkpoint_retains_sampling_without_requiring_source_data(self):
+        with patch("dataset.load_dfs", return_value=(self.books, self.messages)):
+            data = LOBSTERLevel10Dataset(sampling_interval_seconds=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            save_checkpoint(path, TimeGAN(latent_dims=4, noise_dims=4), TrainingConfig(), data)
+            with patch("dataset.load_dfs", side_effect=AssertionError):
+                model, checkpoint = load_checkpoint(path)
+            self.assertEqual(model.sampling_interval_seconds, 1)
+            self.assertEqual(checkpoint["data_config"]["split_policy"], "original_event_cutoff")
+            self.assertEqual(checkpoint["split_time_seconds"], 8.2)
 
 
 if __name__ == "__main__":

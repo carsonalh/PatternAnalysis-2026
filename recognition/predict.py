@@ -64,6 +64,7 @@ def load_checkpoint(path, device: torch.device | str = "cpu") -> tuple[TimeGAN, 
     model.noise_kind = checkpoint["training_config"].get("noise_kind", "wiener_paths")
     model.context_horizon = checkpoint["training_config"].get("context_horizon", 16)
     model.sequence_length = checkpoint["training_config"]["sequence_length"]
+    model.sampling_interval_seconds = checkpoint.get("data_config", {}).get("sampling_interval_seconds")
     model.eval()
     return model, checkpoint
 

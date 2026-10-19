@@ -36,11 +36,14 @@ class TrainingConfig:
     transition_steps: int = 1_000
     joint_steps: int = 5_000
     discriminator_learning_rate: float | None = None
-    generator_updates: int = 1
+    generator_updates: int = 2
+    discriminator_loss_threshold: float | None = 0.15
+    gradient_diagnostic_interval: int = 500
     context_loss_weight: float = 0.0
     context_horizon: int = 16
     noise_kind: str = "wiener_increments"
     price_moment_weight: float = 0.0
+    conditional_drift_weight: float = 0.0
 
     def __post_init__(self):
         if self.sequence_length < 2 or self.batch_size < 1:
@@ -55,16 +58,26 @@ class TrainingConfig:
             raise ValueError("Discriminator learning rate must be finite and positive")
         if not isinstance(self.generator_updates, int) or self.generator_updates < 1:
             raise ValueError("Generator updates must be a positive integer")
+        if (self.discriminator_loss_threshold is not None
+                and (not math.isfinite(self.discriminator_loss_threshold)
+                     or self.discriminator_loss_threshold < 0)):
+            raise ValueError("Discriminator threshold must be finite and nonnegative, or None")
+        if (not isinstance(self.gradient_diagnostic_interval, int)
+                or self.gradient_diagnostic_interval < 0):
+            raise ValueError("Gradient diagnostic interval must be a nonnegative integer")
         if not math.isfinite(self.context_loss_weight) or self.context_loss_weight < 0:
             raise ValueError("Context loss weight must be finite and nonnegative")
         if not isinstance(self.context_horizon, int) or self.context_horizon < 1:
             raise ValueError("Context horizon must be a positive integer")
-        if self.context_loss_weight > 0 and self.context_horizon >= self.sequence_length:
+        if ((self.context_loss_weight > 0 or self.conditional_drift_weight > 0)
+                and self.context_horizon >= self.sequence_length):
             raise ValueError("Context horizon must leave at least one real context event")
         if self.noise_kind not in ("wiener_paths", "wiener_increments"):
             raise ValueError("Noise kind must be wiener_paths or wiener_increments")
         if not math.isfinite(self.price_moment_weight) or self.price_moment_weight < 0:
             raise ValueError("Price moment weight must be finite and nonnegative")
+        if not math.isfinite(self.conditional_drift_weight) or self.conditional_drift_weight < 0:
+            raise ValueError("Conditional drift weight must be finite and nonnegative")
 
 
 def supervised_loss(generator: nn.Module, latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
@@ -95,10 +108,37 @@ def context_price_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
     return errors.square().mean()
 
 
+def conditional_drift_loss(model: TimeGAN, x: torch.Tensor, noise: torch.Tensor,
+                           horizon: int, zero_return: float) -> torch.Tensor:
+    """Regularize expected cumulative log returns toward a zero-drift prior.
+
+    Paired Gaussian innovations (+z, -z) reduce Monte Carlo error in the mean.
+    The zero target is expressed in training-standardized units. This prior
+    makes a lognormal forecast's median stay near its observed starting price.
+    """
+    if not 1 <= horizon < x.shape[1]:
+        raise ValueError("The continuation must leave a nonempty real prefix")
+    with torch.no_grad():
+        context = model.embedder(x[:, :-horizon])[:, -1]
+    innovations = noise[:, 1:horizon + 1]
+    paired = torch.stack((innovations, -innovations), dim=1).flatten(0, 1)
+    future = model.generator.continue_from(context.repeat_interleave(2, dim=0), paired)
+    returns = model.decoder(future)[..., 0].reshape(len(x), 2, horizon)
+    expected = returns.mean(dim=1) - zero_return
+    time = torch.arange(1, horizon + 1, device=x.device, dtype=x.dtype)
+    return (expected.cumsum(dim=1) / time.sqrt()).square().mean()
+
+
 class TimeGANTrainer:
-    def __init__(self, model: TimeGAN, config: TrainingConfig = TrainingConfig()):
+    def __init__(self, model: TimeGAN, config: TrainingConfig = TrainingConfig(),
+                 *, return_mean: float = 0.0, return_std: float = 1.0):
+        if not math.isfinite(return_mean) or not math.isfinite(return_std) or return_std <= 0:
+            raise ValueError("Return normalization must have finite mean and positive SD")
         self.model = model
         self.config = config
+        self.zero_return = -return_mean / return_std
+        self.joint_cycles = 0
+        self.update_counts = dict(generator=0, embedding=0, discriminator=0, discriminator_skipped=0)
         model.noise_kind = config.noise_kind
         model.context_horizon = config.context_horizon
         model.sequence_length = config.sequence_length
@@ -160,12 +200,52 @@ class TimeGANTrainer:
             fake = self.model.generator.sample(noise, seed)
         real_logits = self.model.discriminator(real)
         fake_logits = self.model.discriminator(fake)
-        loss = (F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-                + F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits)))
-        self._step(self.opt_D, loss)
-        return {"discriminator": loss.item()}
+        real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+        fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+        loss = real_loss + fake_loss
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite discriminator loss")
+        threshold = self.config.discriminator_loss_threshold
+        update = threshold is None or loss.item() > threshold
+        # Reuse this graph and noise for the gate and update. A skip must not
+        # advance Adam's moments or step counter. Our BCE has two terms; the
+        # authors' separate-supervisor implementation has a third fake term.
+        if update:
+            self._step(self.opt_D, loss)
+        return {"discriminator": loss.item(), "d_real_bce": real_loss.item(),
+                "d_fake_bce": fake_loss.item(),
+                "d_real_accuracy": (real_logits >= 0).float().mean().item(),
+                "d_fake_accuracy": (fake_logits < 0).float().mean().item(),
+                "d_updates": int(update), "d_skipped": int(not update)}
 
-    def generator_step(self, x: torch.Tensor) -> dict[str, float]:
+    def _gradient_diagnostics(self, components: dict[str, torch.Tensor]) -> dict[str, float]:
+        """Measure weighted gradients on the update graph, before clipping.
+
+        autograd.grad leaves parameter .grad and the RNG untouched. Zero-fill
+        unused initializer parameters so component vectors share coordinates.
+        """
+        parameters = tuple(self.model.generator.parameters())
+        vectors = {}
+        for name, component in components.items():
+            gradients = (torch.autograd.grad(component, parameters, retain_graph=True,
+                                            allow_unused=True) if component.requires_grad
+                         else [None] * len(parameters))
+            vectors[name] = torch.cat([(torch.zeros_like(p) if g is None else g).flatten()
+                                       for p, g in zip(parameters, gradients)])
+        reference = vectors["adversarial"]
+        reference_norm = reference.norm()
+        metrics = {"g_total_gradient_norm": sum(vectors.values()).norm().item()}
+        for name, vector in vectors.items():
+            norm = vector.norm()
+            metrics[f"gradient_norm_{name}"] = norm.item()
+            # A zero component has no direction; report cosine zero by convention.
+            metrics[f"gradient_cosine_{name}_adversarial"] = (
+                (vector @ reference) / (norm * reference_norm).clamp_min(1e-12)).item()
+        if not all(math.isfinite(value) for value in metrics.values()):
+            raise FloatingPointError("Non-finite generator gradient diagnostic")
+        return metrics
+
+    def generator_step(self, x: torch.Tensor, *, diagnose: bool = False) -> dict[str, float]:
         self.train_only(self.model.generator)
         noise, seed = self._noise(x)
         with torch.no_grad():
@@ -175,19 +255,31 @@ class TimeGANTrainer:
         logits = self.model.discriminator(fake)
         adversarial = F.binary_cross_entropy_with_logits(logits, torch.ones_like(logits))
         supervised = supervised_loss(self.model.generator, real, noise)
-        loss = adversarial + self.config.eta * supervised
-        metrics = {"adversarial": adversarial.item(), "g_supervised": supervised.item()}
+        components = {"adversarial": adversarial, "g_supervised": supervised}
         if self.config.context_loss_weight > 0:
             context = context_price_loss(self.model, x, noise, self.config.context_horizon)
-            loss = loss + self.config.context_loss_weight * context
-            metrics["g_context_price"] = context.item()
+            components["g_context_price"] = context
         if self.config.price_moment_weight > 0:
             returns = self.model.decoder(fake)[..., 0]
             target = x[..., 0]
             moments = ((returns.mean() - target.mean()).square()
                        + (returns.std(correction=0) - target.std(correction=0)).square())
-            loss = loss + self.config.price_moment_weight * moments
-            metrics["g_price_moments"] = moments.item()
+            components["g_price_moments"] = moments
+        if self.config.conditional_drift_weight > 0:
+            drift = conditional_drift_loss(self.model, x, noise, self.config.context_horizon,
+                                           self.zero_return)
+            components["g_conditional_drift"] = drift
+        weights = {"adversarial": 1.0, "g_supervised": self.config.eta,
+                   "g_context_price": self.config.context_loss_weight,
+                   "g_price_moments": self.config.price_moment_weight,
+                   "g_conditional_drift": self.config.conditional_drift_weight}
+        weighted = {name: components.get(name, x.new_zeros(())) * weight
+                    for name, weight in weights.items()}
+        loss = sum(weighted.values())
+        metrics = {name: components.get(name, x.new_zeros(())).item() for name in weights}
+        metrics.update({f"weighted_{name}": value.item() for name, value in weighted.items()})
+        if diagnose:
+            metrics.update(self._gradient_diagnostics(weighted))
         self._step(self.opt_G, loss)
         return {"generator": loss.item(), **metrics}
 
@@ -195,22 +287,36 @@ class TimeGANTrainer:
         self.train_only(self.model.embedder, self.model.decoder)
         noise, _ = self._noise(x)
         latents = self.model.embedder(x)
-        reconstruction = F.mse_loss(self.model.decoder(latents), x)
+        decoded = self.model.decoder(latents)
+        reconstruction = F.mse_loss(decoded, x)
         # Both the target and previous latent stay attached to E through frozen G.
         supervised = supervised_loss(self.model.generator, latents, noise)
         loss = reconstruction + self.config.lam * supervised
         self._step(self.opt_ER, loss)
         return {"embedding": loss.item(), "reconstruction": reconstruction.item(),
-                "e_supervised": supervised.item()}
+                "return_reconstruction": F.mse_loss(decoded[..., 0], x[..., 0]).item(),
+                "e_supervised": supervised.item(),
+                "weighted_e_supervised": (self.config.lam * supervised).item()}
 
     def joint_step(self, x: torch.Tensor) -> dict[str, float]:
-        # Each update recomputes its graph and draws fresh noise.
-        metrics = self.discriminator_step(x)
-        generator_metrics = [self.generator_step(x) for _ in range(self.config.generator_updates)]
-        # Log the mean when G takes several updates in one joint iteration.
-        metrics.update({name: sum(row[name] for row in generator_metrics) / len(generator_metrics)
-                        for name in generator_metrics[0]})
-        return metrics | self.embedding_step(x)
+        # Authors' joint schedule: repeat (G, E/R), then conditionally update D.
+        self.joint_cycles += 1
+        interval = self.config.gradient_diagnostic_interval
+        diagnose = interval > 0 and self.joint_cycles % interval == 0
+        rows = []
+        for update in range(self.config.generator_updates):
+            rows.append(self.generator_step(x, diagnose=diagnose and update == 0)
+                        | self.embedding_step(x))
+        metrics = {name: sum(row[name] for row in rows if name in row)
+                         / sum(name in row for row in rows)
+                   for name in dict.fromkeys(name for row in rows for name in row)}
+        metrics.update(self.discriminator_step(x))
+        metrics.update(g_updates=len(rows), e_updates=len(rows))
+        self.update_counts["generator"] += len(rows)
+        self.update_counts["embedding"] += len(rows)
+        self.update_counts["discriminator"] += metrics["d_updates"]
+        self.update_counts["discriminator_skipped"] += metrics["d_skipped"]
+        return metrics
 
     def fit(self, loader: DataLoader, log_every: int = 100) -> list[dict]:
         if len(loader) == 0:
@@ -258,6 +364,8 @@ def save_checkpoint(path: Path, model: TimeGAN, config: TrainingConfig,
         "feature_names": list(data.feature_names),
         "price_representation": "log_return",  # Checkpoint format marker, not a training option.
         "reference_midpoint": data.reference_midpoint,
+        "data_config": data.data_config,
+        "split_time_seconds": data.split_time_seconds,
     }
     torch.save(checkpoint, path)
 
@@ -275,16 +383,21 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("runs/log_return/timegan"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--sampling-interval-seconds", type=float, default=None,
+                        help="Use previous-tick clock snapshots; omit for original event rows")
     for name in ("sequence_length", "batch_size", "autoencoder_steps", "transition_steps", "joint_steps",
-                 "context_horizon"):
+                 "context_horizon", "gradient_diagnostic_interval"):
         parser.add_argument("--" + name.replace("_", "-"), type=int, default=getattr(defaults, name))
     for name in ("learning_rate", "gradient_clip", "lam", "eta", "context_loss_weight",
-                 "price_moment_weight"):
+                 "price_moment_weight", "conditional_drift_weight"):
         parser.add_argument("--" + name.replace("_", "-"), type=float, default=getattr(defaults, name))
     parser.add_argument("--latent-dims", type=int, default=128)
     parser.add_argument("--noise-dims", type=int, default=128)
     parser.add_argument("--discriminator-learning-rate", type=float, default=None)
     parser.add_argument("--generator-updates", type=int, default=defaults.generator_updates)
+    parser.add_argument("--discriminator-loss-threshold", type=float,
+                        default=defaults.discriminator_loss_threshold,
+                        help="Update D only above this summed BCE; zero effectively disables the gate")
     parser.add_argument("--noise-kind", choices=("wiener_paths", "wiener_increments"),
                         default=defaults.noise_kind)
     parser.add_argument("--evaluation-samples", type=int, default=256)
@@ -300,16 +413,17 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    train_data = LOBSTERLevel10Dataset(train=True)
+    train_data = LOBSTERLevel10Dataset(train=True, sampling_interval_seconds=args.sampling_interval_seconds)
     loader = DataLoader(WindowDataset(train_data.features, config.sequence_length),
                         batch_size=config.batch_size, shuffle=True)
     model = TimeGAN(latent_dims=args.latent_dims, noise_dims=args.noise_dims).to(args.device)
-    history = TimeGANTrainer(model, config).fit(loader)
+    history = TimeGANTrainer(model, config, return_mean=train_data.feature_mean[0],
+                             return_std=train_data.feature_std[0]).fit(loader)
     args.output.mkdir(parents=True, exist_ok=True)
     save_checkpoint(args.output / "model.pt", model, config, train_data)
     pd.DataFrame(history).to_csv(args.output / "losses.csv", index=False)
     if not args.skip_evaluation:
-        validation_data = LOBSTERLevel10Dataset(train=False)
+        validation_data = LOBSTERLevel10Dataset(train=False, sampling_interval_seconds=args.sampling_interval_seconds)
         report, generated = evaluate_timegan(model, train_data, validation_data,
                                              sequence_length=config.sequence_length,
                                              samples=args.evaluation_samples,

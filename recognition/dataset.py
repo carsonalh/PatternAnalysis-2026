@@ -49,8 +49,32 @@ def load_dfs() -> tuple[pd.DataFrame, pd.DataFrame]:
     return books, messages
 
 
+def sample_order_book(books: pd.DataFrame, messages: pd.DataFrame,
+                      interval_seconds: float) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """Previous-tick snapshots on a clock grid; never select a future event.
+
+    Empty intervals carry the latest book forward. For simultaneous messages,
+    the last row is the book after all events at that timestamp.
+    """
+    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
+        raise ValueError("Sampling interval must be finite and positive")
+    if len(books) != len(messages) or len(books) < 2 or "time" not in messages:
+        raise ValueError("Sampling requires aligned books and event timestamps")
+    times = messages["time"].to_numpy(dtype=float)
+    if not np.isfinite(times).all() or (np.diff(times) < 0).any():
+        raise ValueError("Event timestamps must be finite and nondecreasing")
+    first = int(np.ceil(times[0] / interval_seconds))
+    last = int(np.floor(times[-1] / interval_seconds))
+    grid = np.arange(first, last + 1) * interval_seconds
+    grid = grid[(grid >= times[0]) & (grid <= times[-1])]
+    if len(grid) < 2:
+        raise ValueError("Sampling must leave at least two snapshots")
+    source_indices = np.searchsorted(times, grid, side="right") - 1
+    return books.iloc[source_indices].reset_index(drop=True), grid, source_indices
+
+
 class LOBSTERLevel10Dataset(Dataset):
-    """Midpoint log returns and book structure, scaled using training events only."""
+    """Midpoint log returns and book structure, scaled using training rows only."""
 
     FEATURE_DIMS: ClassVar = FEATURE_DIMS
     TICK_SIZE: ClassVar = 100  # One cent in LOBSTER's 1/10000-dollar price units.
@@ -62,11 +86,30 @@ class LOBSTERLevel10Dataset(Dataset):
         + tuple(f"log1p_bid_size_{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1))
     )
 
-    def __init__(self, train: bool = True, normalize: bool = True) -> None:
-        books, _messages = load_dfs()
+    def __init__(self, train: bool = True, normalize: bool = True,
+                 *, sampling_interval_seconds: float | None = None) -> None:
+        books, messages = load_dfs()
         self.normalize = normalize
+        self.sampling_interval_seconds = sampling_interval_seconds
+        self.data_config = {"sampling_interval_seconds": sampling_interval_seconds,
+                            "split_policy": "original_event_cutoff"}
         VALIDATION_RATIO = 0.15
         validation_begin = round((1 - VALIDATION_RATIO) * len(books))
+        self.original_event_count = len(books)
+        times = (messages["time"].to_numpy(dtype=float)
+                 if "time" in messages and len(messages) == len(books) else None)
+        self.split_time_seconds = float(times[validation_begin]) if times is not None else None
+        source_indices = np.arange(len(books))
+        if sampling_interval_seconds is not None:
+            books, snapshot_times, source_indices = sample_order_book(
+                books, messages, sampling_interval_seconds)
+            # Preserve the old chronological boundary, not 85% of the new row count.
+            validation_begin = int(np.searchsorted(snapshot_times, self.split_time_seconds))
+        else:
+            snapshot_times = times
+        if not 0 < validation_begin < len(books):
+            raise ValueError("Sampling must leave nonempty training and validation splits")
+        self.snapshot_count = len(books)
 
         asks = books[[f"ASKp{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
         bids = books[[f"BIDp{i}" for i in range(1, _ORDER_BOOK_LEVELS + 1)]].to_numpy()
@@ -93,6 +136,9 @@ class LOBSTERLevel10Dataset(Dataset):
         # Anchor for reconstructing this split; the first day event has return zero.
         self.initial_midpoint = float(midpoints[max(0, begin - 1)])
         self.books = books.iloc[begin:end]
+        self.timestamps = snapshot_times[begin:end] if snapshot_times is not None else None
+        self.source_indices = source_indices[begin:end]
+        self.source_timestamps = times[self.source_indices] if times is not None else None
         features = features[begin:end]
         if self.normalize:
             features = (features - self.feature_mean) / self.feature_std

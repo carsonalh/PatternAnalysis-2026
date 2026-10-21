@@ -154,13 +154,14 @@ class _NextStepPredictor(nn.Module):
         return self.output(states)
 
 
-def _train_predictor(training: torch.Tensor, steps: int) -> _NextStepPredictor:
-    predictor = _NextStepPredictor(training.shape[-1])
+def _train_predictor(training: torch.Tensor, steps: int, predictor: nn.Module | None = None) -> nn.Module:
+    predictor = _NextStepPredictor(training.shape[-1]) if predictor is None else predictor
     optimizer = torch.optim.Adam(predictor.parameters(), lr=3e-4)
     for _ in range(steps):
         batch = training[torch.randint(len(training), (min(64, len(training)),))]
         optimizer.zero_grad(set_to_none=True)
-        loss = F.mse_loss(predictor(batch[:, :-1]), batch[:, 1:])
+        prediction = predictor(batch[:, :-1])
+        loss = F.mse_loss(prediction[0] if isinstance(prediction, tuple) else prediction, batch[:, 1:])
         loss.backward()
         nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
         optimizer.step()
@@ -253,3 +254,42 @@ def evaluate_timegan(model: TimeGAN, training: LOBSTERLevel10Dataset,
             train_real_test_real=real_score, train_synthetic_test_real=generated_score),
     )
     return report, generated
+
+
+def compare_timegan_gru(model: TimeGAN, data: LOBSTERLevel10Dataset):
+    """Fit a GRU; compare training KL and 16-second SSIM after 48-second contexts."""
+    import numpy as np
+    import pandas as pd
+    from skimage.metrics import structural_similarity
+    from simple_gru import SimpleGRU
+
+    real = _select_nonoverlapping_windows(data.features, 64, 256)
+    torch.manual_seed(1)
+    gru = _train_predictor(real, 500, SimpleGRU(features=40, hidden=32)).eval()
+    model.eval()
+    with torch.no_grad():
+        prefix, target = real[:, :48], real[:, 48:].numpy()
+        noise, _ = generate_wiener_paths(len(real), 64, model.generator.noise_dims,
+                                        rng=torch.Generator().manual_seed(2))
+        context = model.embedder(prefix)[:, -1]
+        gan = model.decoder(model.generator.continue_from(context, noise[:, 1:17] - noise[:, :16]))
+        prediction, state = gru(prefix)
+        future = [prediction[:, -1:]]
+        for _ in range(15):
+            prediction, state = gru(future[-1], state)
+            future.append(prediction)
+        generated = {"TimeGAN": gan.numpy(), "GRU": torch.cat(future, dim=1).numpy()}
+    reference = data.features.numpy().astype(float)
+    low, span = reference.min(0), np.maximum(np.ptp(reference, axis=0), 1e-6)
+    edges = [np.r_[-np.inf, np.linspace(lo, lo + width, 33), np.inf] for lo, width in zip(low, span)]
+    def histogram(values):
+        counts = np.stack([np.histogram(values[..., i], bins)[0] for i, bins in enumerate(edges)])
+        p = counts / counts.sum(1, keepdims=True) + 1e-8
+        return p / p.sum(1, keepdims=True)
+    p = histogram(reference)
+    kl = pd.DataFrame({name: (p * np.log(p / histogram(x))).sum(1)
+                       for name, x in generated.items()}, index=data.feature_names)
+    ssim = pd.Series({name: np.mean([structural_similarity((a - low) / span, (b - low) / span,
+        data_range=1, win_size=7, channel_axis=-1) for a, b in zip(target, x)])
+        for name, x in generated.items()}, name="Training continuation SSIM")
+    return kl, ssim

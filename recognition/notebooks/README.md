@@ -1,5 +1,13 @@
 # Notebook guide
 
+Start with [the compact TimeGAN/GRU comparison](timegan_summary.ipynb): it trains
+both models from scratch, plots KL for all 40 features against training data,
+and reports paired continuation SSIM on training windows.
+In WSL/Debian, run `uv sync --locked` then `uv run --locked jupyter lab` from `recognition/`,
+choose **Python 3 (ipykernel)**, and **Restart Kernel and Run All**.
+Its short one-second experiment is independent of
+the historical chapters below; exact replay requires the same CPU/environment.
+
 All four chapters use one fixed feature definition: midpoint log return plus
 39 spread, gap, and order-size features. The model's midpoint input and output
 are always `log(m_t / m_{t-1})`, standardized using training events only.

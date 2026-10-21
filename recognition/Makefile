@@ -8,4 +8,4 @@ install-kernel:
 .PHONY: run-jupyter
 run-jupyter:
 	PYTHONPATH="$(shell realpath .)$${PYTHONPATH:+:$$PYTHONPATH}" \
-	uv run --with jupyter jupyter lab --ServerApp.root_dir="$(shell realpath .)"
+	uv run --locked jupyter lab --ServerApp.root_dir="$(shell realpath .)"

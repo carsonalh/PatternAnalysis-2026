@@ -92,6 +92,7 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
         midpoints = np.log(0.5 * (books["ASKp1"] + books["BIDp1"])).to_numpy()
 
         self.data = torch.tensor([midpoints, spreads, *ask_gaps, *bid_gaps]).T
+        self.data = torch.cat((self.data, torch.log1p(torch.from_numpy(books[[c for c in ORDER_BOOK_COLUMNS if "s" in c]].to_numpy(dtype=float)))), dim=1)
 
     def __len__(self) -> None:
         return len(self.data)

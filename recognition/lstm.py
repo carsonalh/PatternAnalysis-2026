@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataset import FEATURE_DIMS
 
 
 class BaselineLSTM(nn.Module):
@@ -8,11 +9,11 @@ class BaselineLSTM(nn.Module):
         super().__init__()
         self._lstm = nn.LSTM(
             batch_first=True,
-            input_size=20,
+            input_size=FEATURE_DIMS,
             hidden_size=hidden_size,
             num_layers=num_layers,
         )
-        self._linear = nn.Linear(hidden_size, 40)
+        self._linear = nn.Linear(hidden_size, 2 * FEATURE_DIMS)
 
     def forward(self, x: torch.Tensor, hx: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         if not hx:
@@ -23,8 +24,8 @@ class BaselineLSTM(nn.Module):
             hx = (h, c)
         x, (h, c) = self._lstm(x, hx=hx)
         x = self._linear(x)
-        mu = x[..., :20]
-        sigma = 1e-6 + F.softplus(x[..., 20:])
+        mu = x[..., :FEATURE_DIMS]
+        sigma = 1e-6 + F.softplus(x[..., FEATURE_DIMS:])
         x = torch.distributions.Normal(mu, sigma).rsample()
         return x, (mu, sigma), (h, c)
 
@@ -39,7 +40,7 @@ class SplitBaselineLSTM(BaselineLSTM):
     def forward(self, x, hx=None):
         hidden, state = self._lstm(x, hx)
         mu = self._midpoint(hidden)
-        other = self._linear(hidden)[..., 1:20]
+        other = self._linear(hidden)[..., 1:FEATURE_DIMS]
         midpoint = x[..., :1] + self.midpoint_scale * (mu + torch.randn_like(mu))
         return torch.cat((midpoint, other), dim=-1), (mu, other), state
 

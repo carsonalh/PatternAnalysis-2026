@@ -1,7 +1,14 @@
 """Three-stage TimeGAN training; scaling and minibatches use training rows only."""
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from itertools import chain
+import numpy as np
+
+from torch.utils.data import DataLoader
+from dataset import LOBSTERLevel10Dataset, WindowDataset
+from modules import LATENT_DIMS
 from timegan import TimeGAN
 
 
@@ -15,7 +22,7 @@ def fit(data, steps=(1000, 1000, 5000), window=64, batch_size=64, seed=20261025)
     values = ((features - center) / scale).float().to(device)
     model = TimeGAN().to(device)
     encoder, decoder, generator, supervisor, discriminator = (
-        model._encoder, model._decoder, model._generator, model._supervisor, model._discriminator)
+        model.encoder, model.decoder, model.generator, model.supervisor, model.discriminator)
     modules = ((encoder, decoder), (supervisor,), (generator, supervisor), (discriminator,))
     optimizers = [torch.optim.Adam(chain(*(m.parameters() for m in group)), lr=1e-3) for group in modules]
     history = []
@@ -66,3 +73,151 @@ def fit(data, steps=(1000, 1000, 5000), window=64, batch_size=64, seed=20261025)
                 history.append({"stage": stage, "step": step + 1, "loss": loss.item()})
                 print(history[-1], flush=True)
     return model.eval(), values, center, scale, history
+
+
+def pre_train(
+    dataset: WindowDataset,
+    *,
+    epochs: int = 20,
+    device: torch.types.Device = "cuda",
+    dtype: torch.dtype = torch.float32,
+    filename: str = "pretrained.pth",
+    seed: int = 0,
+) -> TimeGAN:
+    if filename:
+        print("Loading pre-trained model from fs cache")
+        path = Path(filename)
+        if path.is_file():
+            with open(path, "rb") as f:
+                return torch.load(f, weights_only=False)
+
+    torch.manual_seed(seed)
+
+    data_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    model = TimeGAN().to(device, dtype)
+
+    recon_optim = torch.optim.Adam(chain(model.encoder.parameters(), model.decoder.parameters()), lr=3e-4)
+    supervisor_optim = torch.optim.Adam(model.supervisor.parameters(), lr=3e-4)
+
+    batch_losses: list[float]
+
+    batch: torch.Tensor
+    labels: torch.Tensor
+
+    print("Beginning auto-encoder pre-training")
+    for epoch in range(epochs):
+        batch_losses = []
+        for batch, labels in data_loader:
+            batch = batch.to(device, dtype)
+            labels = labels.to(device, dtype)
+
+            recon = model.decode(model.encode(batch))
+            recon_loss = F.mse_loss(recon, batch)
+            recon_optim.zero_grad()
+            recon_loss.backward()
+            recon_optim.step()
+
+            batch_losses.append((10 * recon_loss.sqrt()).item())
+
+        print(f"Finished training epoch {epoch + 1}; recon. loss (batch mean): {np.mean(batch_losses)}")
+
+    print("Begin supervisor pre-training")
+    for epoch in range(epochs):
+        batch_losses = []
+        for batch, labels in data_loader:
+            batch = batch.to(device, dtype)
+            labels = labels.to(device, dtype)
+
+            both_windows = torch.cat((batch, labels[:, None, :]), dim=1)
+            with torch.no_grad():
+                h = model.encode(both_windows)
+            h_current = h[:, :-1, :]
+            h_next = h[:, 1:, :]
+            pred = model.supervisor(h_current)
+            pred_loss = F.mse_loss(pred, h_next)
+            supervisor_optim.zero_grad()
+            pred_loss.backward()
+            supervisor_optim.step()
+
+            batch_losses.append((10 * pred_loss.sqrt()).item())
+        print(f"Finished training epoch {epoch + 1}; supervised loss (batch mean): {np.mean(batch_losses)}")
+
+    with open(filename, "wb") as f:
+        torch.save(model, f)
+    print(f"Saved model to {filename}")
+    print(f"Done pre-training")
+
+    return model
+
+def train(dataset: WindowDataset) -> None:
+    epochs = 20
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    model = pre_train(dataset, device=device, dtype=dtype)
+
+    torch.manual_seed(0)
+
+    data_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    batch: torch.Tensor
+    labels: torch.Tensor
+
+    gen_optim = torch.optim.Adam(chain(model.generator.parameters(), model.supervisor.parameters()), lr=3e-4)
+    dis_optim = torch.optim.Adam(model.discriminator.parameters(), lr=3e-4)
+
+    for epoch in range(epochs):
+        dis_batch_losses: list[float] = []
+        gen_batch_losses: list[float] = []
+        for batch, labels in data_loader:
+            batch = batch.to(device, dtype)
+            labels = labels.to(device, dtype)
+
+            # Adversarial loss training:
+
+            with torch.no_grad():
+                h_real = model.encode(batch)
+            adv_dis_loss_real = F.binary_cross_entropy(
+                model.discriminate(h_real),
+                torch.ones(*batch.shape[:2], 1, device=device, dtype=dtype),
+            )
+
+            with torch.no_grad():
+                h_fake = model.generate(*batch.shape[:2])
+            adv_dis_loss_fake = F.binary_cross_entropy(
+                model.discriminate(h_fake),
+                torch.zeros(*batch.shape[:2], 1, device=device, dtype=dtype),
+            )
+
+            adv_dis_loss = adv_dis_loss_real + adv_dis_loss_fake
+            dis_optim.zero_grad()
+            adv_dis_loss.backward()
+            dis_optim.step()
+
+            dis_batch_losses.append(0.5 * (adv_dis_loss_real.item() + adv_dis_loss_fake.item()))
+
+            h_fake = model.generate(*batch.shape[:2])
+            adv_gen_loss = F.binary_cross_entropy(
+                model.discriminate(h_fake),
+                torch.ones(*batch.shape[:2], 1, device=device, dtype=dtype),
+            )
+            gen_optim.zero_grad()
+            dis_optim.zero_grad()
+            adv_gen_loss.backward()
+            gen_optim.step()
+
+            gen_batch_losses.append(adv_gen_loss.item())
+
+            # TODO Temporal loss training
+
+        print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses)}; gen. loss (batch mean): {np.mean(gen_batch_losses)}")
+
+if __name__ == "__main__":
+    # First standardize dataset
+    data = LOBSTERLevel10Dataset(train=True).data
+    mean, std = data.mean(0), data.std(0).clamp_min(1e-3)
+    data = (data.clone() - mean[None, ...]) / std[None, ...]
+
+    dataset = WindowDataset(data)
+    train(dataset)

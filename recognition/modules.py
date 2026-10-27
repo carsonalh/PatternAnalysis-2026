@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataset import FEATURE_DIMS
 
 
@@ -36,7 +37,8 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._lstm(x)
-        return torch.sigmoid(x)  # Match the generator and supervisor latent range.
+        x = F.sigmoid(x)
+        return x
 
 
 class Decoder(nn.Module):
@@ -65,7 +67,9 @@ class Generator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self._lstm(x))
+        x = self._lstm(x)
+        x = F.sigmoid(x)
+        return x
 
 
 class Discriminator(nn.Module):
@@ -80,4 +84,5 @@ class Discriminator(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._lstm(x)
+        x = F.sigmoid(x)
         return x

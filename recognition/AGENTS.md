@@ -26,3 +26,7 @@ total. When generating code, most prompts should have about 5 lines of code
 changed, or 30 lines at the very most. This is all to keep the user from being
 confused by your output, so it's important that you strictly adhere to these
 brevity guidelines.
+
+## README
+
+DO NOT TOUCH THE README.

@@ -85,9 +85,9 @@ def pre_train(
     seed: int = 0,
 ) -> TimeGAN:
     if filename:
-        print("Loading pre-trained model from fs cache")
         path = Path(filename)
         if path.is_file():
+            print("Loading pre-trained model from fs cache")
             with open(path, "rb") as f:
                 return torch.load(f, weights_only=False)
 
@@ -165,6 +165,7 @@ def train(dataset: WindowDataset) -> None:
     labels: torch.Tensor
 
     gen_optim = torch.optim.Adam(chain(model.generator.parameters(), model.supervisor.parameters()), lr=3e-4)
+    recon_optim = torch.optim.Adam(chain(model.encoder.parameters(), model.decoder.parameters()), lr=3e-4)
     dis_optim = torch.optim.Adam(model.discriminator.parameters(), lr=3e-4)
 
     for epoch in range(epochs):
@@ -173,8 +174,45 @@ def train(dataset: WindowDataset) -> None:
         for batch, labels in data_loader:
             batch = batch.to(device, dtype)
             labels = labels.to(device, dtype)
+            both_windows = torch.cat((batch, labels[:, None, :]), dim=1)
 
-            # Adversarial loss training:
+            # Two generator/autoencoder update pairs precede each discriminator update.
+            for _ in range(2):
+                with torch.no_grad():
+                    h = model.encode(both_windows)
+
+                # Both generated latent sequences should look real to the discriminator.
+                e_fake = model.generator(torch.randn(*batch.shape[:2], LATENT_DIMS, device=device, dtype=dtype))
+                h_fake = model.supervisor(e_fake)
+                adv_gen_loss = F.binary_cross_entropy(
+                    model.discriminate(h_fake),
+                    torch.ones(*batch.shape[:2], 1, device=device, dtype=dtype),
+                )
+                adv_gen_loss_e = F.binary_cross_entropy(
+                    model.discriminate(e_fake),
+                    torch.ones(*batch.shape[:2], 1, device=device, dtype=dtype),
+                )
+                adv_gen_loss = adv_gen_loss + adv_gen_loss_e
+                supervised_loss = F.mse_loss(model.supervisor(h[:, :-1]), h[:, 1:])
+                synthetic = model.decode(h_fake)
+                # Match batch means and standard deviations at each timestep.
+                moment_loss = (synthetic.mean(0) - batch.mean(0)).abs().mean()
+                real_std = (batch.var(0, unbiased=False) + 1e-6).sqrt()
+                fake_std = (synthetic.var(0, unbiased=False) + 1e-6).sqrt()
+                moment_loss = moment_loss + (fake_std - real_std).abs().mean()
+                gen_loss = adv_gen_loss + 100 * (supervised_loss + 1e-8).sqrt() + 100 * moment_loss
+                model.zero_grad()
+                gen_loss.backward()
+                gen_optim.step()
+                gen_batch_losses.append(gen_loss.item())
+
+                # Recompute embeddings after the supervisor update, retaining encoder gradients.
+                h = model.encode(both_windows)
+                recon_loss = F.mse_loss(model.decode(h[:, :-1]), batch)
+                supervised_loss = F.mse_loss(model.supervisor(h[:, :-1]), h[:, 1:])
+                model.zero_grad()
+                (10 * (recon_loss + 1e-8).sqrt() + 0.1 * supervised_loss).backward()
+                recon_optim.step()
 
             with torch.no_grad():
                 h_real = model.encode(batch)
@@ -184,34 +222,29 @@ def train(dataset: WindowDataset) -> None:
             )
 
             with torch.no_grad():
-                h_fake = model.generate(*batch.shape[:2])
+                e_fake = model.generator(torch.randn(*batch.shape[:2], LATENT_DIMS, device=device, dtype=dtype))
+                h_fake = model.supervisor(e_fake)
             adv_dis_loss_fake = F.binary_cross_entropy(
                 model.discriminate(h_fake),
                 torch.zeros(*batch.shape[:2], 1, device=device, dtype=dtype),
             )
 
-            adv_dis_loss = adv_dis_loss_real + adv_dis_loss_fake
-            dis_optim.zero_grad()
-            adv_dis_loss.backward()
-            dis_optim.step()
-
-            dis_batch_losses.append(0.5 * (adv_dis_loss_real.item() + adv_dis_loss_fake.item()))
-
-            h_fake = model.generate(*batch.shape[:2])
-            adv_gen_loss = F.binary_cross_entropy(
-                model.discriminate(h_fake),
-                torch.ones(*batch.shape[:2], 1, device=device, dtype=dtype),
+            adv_dis_loss_fake_e = F.binary_cross_entropy(
+                model.discriminate(e_fake),
+                torch.zeros(*batch.shape[:2], 1, device=device, dtype=dtype),
             )
-            gen_optim.zero_grad()
+
+            adv_dis_loss = adv_dis_loss_real + adv_dis_loss_fake + adv_dis_loss_fake_e
             dis_optim.zero_grad()
-            adv_gen_loss.backward()
-            gen_optim.step()
+            if adv_dis_loss.item() > 0.15:
+                adv_dis_loss.backward()
+                dis_optim.step()
 
-            gen_batch_losses.append(adv_gen_loss.item())
-
-            # TODO Temporal loss training
+            dis_batch_losses.append(adv_dis_loss.item() / 3)
 
         print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses)}; gen. loss (batch mean): {np.mean(gen_batch_losses)}")
+
+    torch.save(model, "timegan.pth")
 
 if __name__ == "__main__":
     # First standardize dataset

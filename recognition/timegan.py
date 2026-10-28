@@ -1,23 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from modules import Encoder, Decoder, Generator, Discriminator
-
-
-def standardize_returns(data):
-    """Convert log midpoint levels to returns, then fit training-only scales."""
-    features = data[1:].clone()
-    features[:, 0] -= data[:-1, 0]
-    mean, std = features.mean(0), features.std(0).clamp_min(1e-8)
-    return (features - mean) / std, mean, std
-
-
-def midpoint_prices(normalized, mean, std, initial_price):
-    """Undo return scaling and anchor a price window in USD, outside the model."""
-    returns = normalized[:, 1:, 0].double() * std[0] + mean[0]
-    initial = torch.as_tensor(initial_price, dtype=returns.dtype, device=returns.device).reshape(-1, 1)
-    initial = initial.expand(len(returns), 1)
-    return torch.cat((initial, initial * returns.cumsum(1).exp()), dim=1)
 
 
 class TimeGAN(nn.Module):

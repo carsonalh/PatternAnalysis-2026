@@ -56,9 +56,7 @@ increasing, and that the best bid is less than the best ask.
 We split our data temporally into a training and validation set (the training
 set being the first 85% of points in the dataset, and the validation set being
 the final 15%). This ensures continuity of our prediction, while also
-eliminating any lookahead bias. As most events in the dataset don’t move the
-price, we also summarise points in short time windows to those which do,
-reducing training data size by about 70% while not impacting model performance.
+eliminating any lookahead bias.
 
 We model our feature space such that the model is constrained to predict
 according to our aforementioned prior assumptions about the data. For instance,
@@ -128,8 +126,8 @@ I.e., multiple varied completions of the training set can be generated, none of 
 
 Despite introducing a KL loss term to TimeGAN, target KL loss of 0.1 was not able to be achieved.
 
-* TimeGAN KL loss of log returns: 1.55.
-* Baseline LSTM KL loss of log returns: 0.69.
+* TimeGAN KL loss of log returns: 0.75.
+* Baseline LSTM KL loss of log returns: 0.88.
 
 Due to a strong mode of zero in the dataset, getting KL divergence to be reduced posed challenges.
 For instance, the baseline model predicted a distribution of the next data point which was gaussian.
@@ -139,10 +137,7 @@ However, with long runs of zeros, even a tight gaussian distribution would inevi
 
 TimeGAN resources:
 
-* Training VRAM: < 4GiB. Measured using `nvidia-smi` while the program was
-  running. Due to programming environment (WSL), exact information about
-  per-process VRAM usage was unavailable, but overall usage remained constant
-  throughout training.
+* Training VRAM: 4GiB.
 * Total model parameters: 1,859,113.
 * Training time (on Nvidia RTX 5070 GPU): ~950s.
 

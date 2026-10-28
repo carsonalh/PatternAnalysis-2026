@@ -50,6 +50,17 @@ def load_dfs() -> tuple[pd.DataFrame, pd.DataFrame]:
     return books, messages
 
 
+def positive_transform(values):
+    """Log coordinates for strictly positive physical features."""
+    return np.log(np.maximum(values, 1e-8))
+
+
+def positive_inverse(values: torch.Tensor) -> torch.Tensor:
+    # Bound only numerical extremes before exponentiating.
+    upper = np.log(torch.finfo(values.dtype).max) - 1
+    return values.clamp(min=np.log(1e-8), max=upper).exp()
+
+
 class LOBSTERLevel10Dataset(Dataset, Sequence):
     _VALIDATION_RATIO: Final[float] = 0.15
 
@@ -57,13 +68,13 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
         books, messages = load_dfs()
         validation_begin = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO) * len(books))
 
-        ask_gaps = [np.log1p(books[f"ASKp{i}"] - books[f"ASKp{i - 1}"]).to_numpy() for i in range(2, 11)]
-        bid_gaps = [np.log1p(books[f"BIDp{i - 1}"] - books[f"BIDp{i}"]).to_numpy() for i in range(2, 11)]
-        spreads = np.log1p(books["ASKp1"] - books["BIDp1"]).to_numpy()
+        ask_gaps = [positive_transform(books[f"ASKp{i}"] - books[f"ASKp{i - 1}"]).to_numpy() for i in range(2, 11)]
+        bid_gaps = [positive_transform(books[f"BIDp{i - 1}"] - books[f"BIDp{i}"]).to_numpy() for i in range(2, 11)]
+        spreads = positive_transform(books["ASKp1"] - books["BIDp1"]).to_numpy()
         midpoints = np.log(0.5 * (books["ASKp1"] + books["BIDp1"])).to_numpy()
 
         self.data = torch.tensor(np.array([midpoints, spreads, *ask_gaps, *bid_gaps])).T
-        self.data = torch.cat((self.data, torch.log1p(torch.from_numpy(books[[c for c in ORDER_BOOK_COLUMNS if "s" in c]].to_numpy(dtype=float)))), dim=1)
+        self.data = torch.cat((self.data, torch.from_numpy(positive_transform(books[[c for c in ORDER_BOOK_COLUMNS if "s" in c]].to_numpy(dtype=float)))), dim=1)
 
         # Use log returns on midpoint prices, instead of the log prices themselves
         returns = self.data[1:, 0] - self.data[:-1, 0]
@@ -73,6 +84,7 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
 
         train_data = self.data[:validation_begin]
         train_mean, train_std = train_data.mean(0), train_data.std(0).clamp_min(1e-8)
+        self.mean, self.std = train_mean, train_std
 
         if train:
             self.data = (self.data[:validation_begin] - train_mean) / train_std

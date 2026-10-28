@@ -1,9 +1,9 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from dataset import LOBSTERLevel10Dataset, load_dfs
+from dataset import LOBSTERLevel10Dataset, load_dfs, positive_inverse
 
-WINDOW_SIZE = 780
+WINDOW_SIZE = 1_000
 WARMUP_SIZE = 512
 
 
@@ -17,14 +17,19 @@ if __name__ == "__main__":
     mean, std = training_returns.mean(), training_returns.std().clamp_min(1e-8)
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
     with torch.inference_mode():
-        context = LOBSTERLevel10Dataset(train=True).data[-WARMUP_SIZE:].to(next(model.parameters()))
+        training = LOBSTERLevel10Dataset(train=True)
+        context = training.data[-WARMUP_SIZE:].to(next(model.parameters()))
         context = context.unsqueeze(0).expand(3, -1, -1)
         warmup = context.size(1)
         # Burn in the noise-only generator; real training history warms the supervisor and decoder.
         noise = torch.randn(3, warmup + WINDOW_SIZE, model._latent_dims, dtype=context.dtype)
         synthetic = model.generator(noise)[:, warmup:]
         latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
-        normalized = model.decode(latent)[:, warmup:, 0].double()
+        decoded = model.decode(latent)[:, warmup:].double()
+        physical = decoded * training.std + training.mean
+        physical[..., 1:] = positive_inverse(physical[..., 1:])
+        assert torch.isfinite(physical).all() and (physical[..., 1:] > 0).all()
+        normalized = decoded[..., 0]
         returns = normalized * std + mean
         # Each sample starts from the last training midpoint; these are independent paths.
         generated = (log_midpoint[split - 1] + returns.cumsum(1)).exp().numpy() / 10000
@@ -36,7 +41,7 @@ if __name__ == "__main__":
     plt.xlabel("Validation event")
     plt.ylabel("Midpoint (USD)")
     plt.ticklabel_format(axis="y", style="plain", useOffset=False)
-    plt.title(f"AMZN midpoint: first {WINDOW_SIZE} validation events")
+    plt.title(f"Log/exp: AMZN midpoint: first {WINDOW_SIZE} validation events")
     plt.legend()
     plt.tight_layout()
     plt.savefig("predictions_closeup.png", dpi=150)

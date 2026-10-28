@@ -28,7 +28,7 @@ Therefore, our relevant "static" features are already fixed, so there is no need
 
 ## Figure/visualisation
 
-Some long-running predictions from the TimeGAN at the beginning of the validation set.
+Some predictions from the TimeGAN at the beginning of the validation set.
 
 ![Predictions vs validation data](./predictions.png)
 
@@ -158,11 +158,11 @@ A qualitative example of this can be seen with predictions from each model at a 
 As previously mentioned a feature of the dataset is a strong mode of zero (due to midpoint prices remaining stagnant for brief moments in time, while best-ask and best-bid prices contain large volumes).
 The LSTM model, having the ability to directly output values in the feature space, can produce these trends.
 
-TimeGAN close-up predictions:
+TimeGAN predictions:
 
-![TimeGAN predictions close-up](./predictions_closeup.png)
+![TimeGAN predictions close-up](./predictions.png)
 
-LSTM close-up predictions:
+LSTM predictions:
 
 ![LSTM predictions close-up](./lstm_predictions.png)
 

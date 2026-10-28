@@ -1,6 +1,7 @@
 __pycache__
 *.pyc
 *.pth
+*.png
 
 data/
 notebooks/data/

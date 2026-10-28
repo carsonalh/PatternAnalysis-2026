@@ -87,14 +87,15 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
 
 
 class WindowDataset(Dataset):
-    def __init__(self, data: Sequence[torch.Tensor], window_size: int = 64):
-        if data[0].ndim != 1 or window_size < 2:
+    def __init__(self, data: Sequence[torch.Tensor], window_size: int = 64, stride: int = 1):
+        if data[0].ndim != 1 or window_size < 2 or stride < 1:
             raise ValueError()
         self.data = data
         self.window_size = window_size
+        self.stride = stride
 
     def __len__(self) -> int:
-        return max(0, len(self.data) - self.window_size)
+        return max(0, (len(self.data) - self.window_size + self.stride - 1) // self.stride)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         if index < 0:
@@ -102,4 +103,5 @@ class WindowDataset(Dataset):
         if not 0 <= index < len(self):
             raise IndexError(index)
 
+        index *= self.stride
         return self.data[index:index + self.window_size], self.data[index + self.window_size]

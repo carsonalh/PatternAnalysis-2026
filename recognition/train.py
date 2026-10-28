@@ -11,13 +11,21 @@ from dataset import LOBSTERLevel10Dataset, WindowDataset
 from modules import LATENT_DIMS, TimeGAN
 
 
+def soft_histogram(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+    """Soft bin probabilities; sigmoid boundaries give gradients and open tails."""
+    cdf = torch.sigmoid((edges[1:-1] - values.reshape(-1, 1)) / (1e-2 * (edges[1] - edges[0])))
+    cdf = torch.cat((torch.zeros_like(cdf[:, :1]), cdf, torch.ones_like(cdf[:, :1])), dim=1)
+    probabilities = cdf.diff(dim=1).mean(0) + 1e-8
+    return probabilities / probabilities.sum()
+
+
 def pre_train(
     dataset: WindowDataset,
     *,
     epochs: int = 20,
     device: torch.types.Device = "cuda",
     dtype: torch.dtype = torch.float32,
-    filename: str = "pretrained_returns.pth",
+    filename: str = "pretrained.pth",
     seed: int = 0,
 ) -> TimeGAN:
     if filename:
@@ -30,7 +38,7 @@ def pre_train(
 
     torch.manual_seed(seed)
 
-    data_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    data_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     model = TimeGAN().to(device, dtype)
 
@@ -91,13 +99,14 @@ def train(
     dataset: WindowDataset,
     *,
     epochs: int = 20,
-    filename: str = "timegan_returns.pth",
+    filename: str = "timegan.pth",
     balance: float | None = None,
     smoothing: float = 0.0,
     balance_total: bool = False,
     max_streak: int | None = None,
-    pretrain_filename: str = "pretrained_returns.pth",
+    pretrain_filename: str = "pretrained.pth",
     pretrain_epochs: int = 20,
+    kl_weight: float = 1.0,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -113,6 +122,11 @@ def train(
     torch.manual_seed(0)
 
     data_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    # Fix the soft reference from training rows once, without overlapping windows.
+    training_returns = torch.stack([row[0] for row in dataset.data]).detach().to(device, dtype)
+    low, high = training_returns.min(), training_returns.max()
+    kl_edges = torch.linspace(low, low + (high - low).clamp_min(1e-6), 51, device=device, dtype=dtype)
+    kl_target = soft_histogram(training_returns, kl_edges).detach()
 
     batch: torch.Tensor
     labels: torch.Tensor
@@ -125,7 +139,7 @@ def train(
     for epoch in range(epochs):
         dis_batch_losses: list[float] = []
         gen_batch_losses: list[float] = []
-        gen_components: list[tuple[float, float, float]] = []
+        gen_components: list[tuple[float, float, float, float]] = []
         updates = [0, 0]
         for batch, labels in data_loader:
             batch = batch.to(device, dtype)
@@ -160,16 +174,17 @@ def train(
                 real_std = (batch.var(0, unbiased=False) + 1e-6).sqrt()
                 fake_std = (synthetic.var(0, unbiased=False) + 1e-6).sqrt()
                 moment_loss = moment_loss + (fake_std - real_std).abs().mean()
-                gen_loss = adv_gen_loss + 100 * (supervised_loss + 1e-8).sqrt() + 100 * moment_loss
+                kl_loss = F.kl_div(soft_histogram(synthetic[..., 0], kl_edges).log(), kl_target, reduction="sum")
+                gen_loss = adv_gen_loss + 100 * (supervised_loss + 1e-8).sqrt() + 100 * moment_loss + kl_weight * kl_loss
                 model.zero_grad()
                 if update_generator:
                     gen_loss.backward()
                     gen_optim.step()
                     updates[0] += 1
                 gen_batch_losses.append(gen_loss.item())
-                # Log weighted contributions so their sum matches the generator total.
+                # Log weighted TimeGAN terms and the raw soft midpoint-return KL.
                 gen_components.append((adv_gen_loss.item(), 100 * (supervised_loss.item() + 1e-8) ** 0.5,
-                                       100 * moment_loss.item()))
+                                       100 * moment_loss.item(), kl_loss.item()))
 
                 # Recompute embeddings after the supervisor update, retaining encoder gradients.
                 h = model.encode(both_windows)
@@ -219,15 +234,18 @@ def train(
                     rates = smoothing * rates + (1 - smoothing) * change
                 previous = current
 
-        adversarial, supervised, moment = np.mean(gen_components, axis=0)
+        adversarial, supervised, moment, midpoint_kl = np.mean(gen_components, axis=0)
         print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses):.4f}; "
               f"gen. loss (batch mean): {np.mean(gen_batch_losses):.4f}; adversarial: {adversarial:.4f}; "
-              f"supervised (weighted): {supervised:.4f}; moment (weighted): {moment:.4f}; G/D updates: {updates[0]}/{updates[1]}", flush=True)
+              f"supervised (weighted): {supervised:.4f}; moment (weighted): {moment:.4f}; midpoint KL (soft): {midpoint_kl:.4f}; G/D updates: {updates[0]}/{updates[1]}", flush=True)
 
     torch.save(model, filename)
 
 if __name__ == "__main__":
-    data = LOBSTERLevel10Dataset(train=True).data
-    dataset = WindowDataset(data)
 
-    train(dataset, filename="timegan_returns.pth", pretrain_filename="pretrained_returns.pth")
+    torch.set_num_threads(4)
+    data = LOBSTERLevel10Dataset(train=True).data
+    dataset = WindowDataset(data, window_size=512, stride=32)
+
+    # The displayed validation plots used joint epoch 4 after both pretraining stages.
+    train(dataset, epochs=20, pretrain_epochs=20, filename="timegan.pth", pretrain_filename="pretrained.pth", balance=0.5)

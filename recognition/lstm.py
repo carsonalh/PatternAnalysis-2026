@@ -1,62 +1,91 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataset import FEATURE_DIMS
 
 
-class BaselineLSTM(nn.Module):
-    def __init__(self, *, hidden_size: int = 1024, num_layers: int = 3) -> None:
+class GaussianLSTM(nn.Module):
+    def __init__(self, hidden_size: int = 128):
         super().__init__()
-        self._lstm = nn.LSTM(
-            batch_first=True,
-            input_size=FEATURE_DIMS,
+        self.lstm = nn.LSTM(
+            input_size=40,
             hidden_size=hidden_size,
-            num_layers=num_layers,
+            num_layers=2,
+            batch_first=True,
         )
-        self._linear = nn.Linear(hidden_size, 2 * FEATURE_DIMS)
+        self.linear = nn.Linear(hidden_size, 80)
 
-    def forward(self, x: torch.Tensor, hx: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        if not hx:
-            # Hidden and cell states use (layers, batch, hidden), even with batch_first=True.
-            state_shape = (self._lstm.num_layers, x.shape[0], self._lstm.hidden_size)
-            h = x.new_zeros(state_shape)
-            c = x.new_zeros(state_shape)
-            hx = (h, c)
-        x, (h, c) = self._lstm(x, hx=hx)
-        x = self._linear(x)
-        mu = x[..., :FEATURE_DIMS]
-        sigma = 1e-6 + F.softplus(x[..., FEATURE_DIMS:])
-        x = torch.distributions.Normal(mu, sigma).rsample()
-        return x, (mu, sigma), (h, c)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x, _ = self.lstm(x)
+        mu, sigma = self.linear(x).chunk(2, dim=-1)
+        return mu, F.softplus(sigma).clamp_min(1e-6)
 
-class SplitBaselineLSTM(BaselineLSTM):
-    """Gaussian log returns with fixed training volatility; freeze the mean head for zero drift."""
-    def __init__(self, midpoint_scale: float, **kwargs):
-        super().__init__(**kwargs)
-        self.register_buffer("midpoint_scale", torch.tensor(midpoint_scale))
-        self._midpoint = nn.Linear(self._lstm.hidden_size, 1, bias=False)
-        nn.init.zeros_(self._midpoint.weight)
 
-    def forward(self, x, hx=None):
-        hidden, state = self._lstm(x, hx)
-        mu = self._midpoint(hidden)
-        other = self._linear(hidden)[..., 1:FEATURE_DIMS]
-        midpoint = x[..., :1] + self.midpoint_scale * (mu + torch.randn_like(mu))
-        return torch.cat((midpoint, other), dim=-1), (mu, other), state
+if __name__ == "__main__":
+    from dataset import LOBSTERLevel10Dataset, WindowDataset, load_dfs
+    from evaluation import kl_divergence
+    from torch.utils.data import DataLoader
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-    def loss(self, x, target):
-        _, (mu, other), _ = self(x)
-        returns = (target[..., :1] - x[..., :1]) / self.midpoint_scale
-        return F.gaussian_nll_loss(mu, returns, torch.ones_like(mu)) + F.mse_loss(other, target[..., 1:])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
 
-class GaussianReturnLSTM(nn.Module):
-    """Predict a normal distribution for the next standardized log return."""
-    def __init__(self, hidden_size: int = 32):
-        super().__init__()
-        self.lstm = nn.LSTM(1, hidden_size, batch_first=True)
-        self.head = nn.Linear(hidden_size, 2)
+    dataset = WindowDataset(LOBSTERLevel10Dataset(train=True).data, window_size=256)
+    data_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
-    def forward(self, x, state=None):
-        hidden, state = self.lstm(x, state)
-        mu, raw_sigma = self.head(hidden[:, -1]).chunk(2, dim=-1)
-        return mu, F.softplus(raw_sigma) + 1e-3, state
+    model = GaussianLSTM().to(device, dtype)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    for epoch in range(5):
+        losses = []
+
+        for window, next in data_loader:
+            window, next = window.to(device, dtype), next.to(device, dtype)
+            shifted = torch.cat((window[:, 1:, :], next[:, None, :]), dim=1)
+
+            mean, std = model(window)
+
+            loss = F.gaussian_nll_loss(mean, shifted, std.square())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            losses.append(loss.item())
+
+        print(f"Epoch {epoch + 1}; NLL Loss: {np.mean(losses):.3f}")
+
+    window_size, num_windows, num_samples = dataset.window_size, 3, 3
+    books, _ = load_dfs()
+    log_midpoint = np.log((books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy()) / 2)
+    split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO) * len(books))
+    training_returns = torch.from_numpy(np.diff(log_midpoint[:split]))
+    return_mean, return_std = training_returns.mean(), training_returns.std().clamp_min(1e-8)
+    context = dataset.data[-window_size:].unsqueeze(0).expand(num_samples, -1, -1).to(device, dtype)
+    model.eval()
+    with torch.inference_mode():
+        # Warm up on training history, then feed sampled features back into the LSTM.
+        state, sampled = None, []
+        for _ in range(num_windows * window_size):
+            hidden, state = model.lstm(context, state)
+            mean, raw_std = model.linear(hidden[:, -1:]).chunk(2, dim=-1)
+            context = torch.distributions.Normal(mean, F.softplus(raw_std).clamp_min(1e-6)).sample()
+            sampled.append(context[:, 0, 0])
+        returns = torch.stack(sampled, dim=1).cpu().double() * return_std + return_mean
+        generated = (log_midpoint[split - 1] + returns.cumsum(1)).exp().numpy() / 10000
+    actual_returns = np.diff(log_midpoint[split - 1:split + returns.size(1)])
+    print(f"KL(validation || predicted): {kl_divergence(actual_returns, returns.numpy()):.6f} nats "
+          f"(50 bins; first {returns.size(1)} validation events)")
+    actual = np.exp(log_midpoint[split:split + generated.shape[1]]) / 10000
+    plt.figure(figsize=(10, 5))
+    plt.plot(actual, color="black", linewidth=2, label="Validation")
+    for i, prices in enumerate(generated):
+        plt.plot(prices, alpha=0.75, label=f"GaussianLSTM sample {i + 1}")
+    for boundary in range(window_size, generated.shape[1], window_size):
+        plt.axvline(boundary - 0.5, color="gray", linestyle="--", alpha=0.5)
+    plt.xlabel("Validation event")
+    plt.ylabel("Midpoint (USD)")
+    plt.ticklabel_format(axis="y", style="plain", useOffset=False)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("lstm_predictions.png", dpi=150)

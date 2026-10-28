@@ -57,11 +57,6 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
         books, messages = load_dfs()
         validation_begin = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO) * len(books))
 
-        if train:
-            books, messages = books[:validation_begin], messages[:validation_begin]
-        else:
-            books, messages = books[validation_begin:], messages[validation_begin:]
-
         ask_gaps = [np.log1p(books[f"ASKp{i}"] - books[f"ASKp{i - 1}"]).to_numpy() for i in range(2, 11)]
         bid_gaps = [np.log1p(books[f"BIDp{i - 1}"] - books[f"BIDp{i}"]).to_numpy() for i in range(2, 11)]
         spreads = np.log1p(books["ASKp1"] - books["BIDp1"]).to_numpy()
@@ -69,6 +64,20 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
 
         self.data = torch.tensor(np.array([midpoints, spreads, *ask_gaps, *bid_gaps])).T
         self.data = torch.cat((self.data, torch.log1p(torch.from_numpy(books[[c for c in ORDER_BOOK_COLUMNS if "s" in c]].to_numpy(dtype=float)))), dim=1)
+
+        # Use log returns on midpoint prices, instead of the log prices themselves
+        returns = self.data[1:, 0] - self.data[:-1, 0]
+        self.data = self.data[1:].clone()
+        self.data[:, 0] = returns
+        validation_begin -= 1
+
+        train_data = self.data[:validation_begin]
+        train_mean, train_std = train_data.mean(0), train_data.std(0).clamp_min(1e-8)
+
+        if train:
+            self.data = (self.data[:validation_begin] - train_mean) / train_std
+        else:
+            self.data = (self.data[validation_begin:] - train_mean) / train_std
 
     def __len__(self) -> None:
         return len(self.data)

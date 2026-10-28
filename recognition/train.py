@@ -229,9 +229,6 @@ def train(
 
 if __name__ == "__main__":
     data = LOBSTERLevel10Dataset(train=True).data
-
-    train_mean, train_std = data.mean(0), data.std(0).clamp_min(1e-8)
-    data = (data - train_mean) / train_std
-
     dataset = WindowDataset(data)
+
     train(dataset, filename="timegan_returns.pth", pretrain_filename="pretrained_returns.pth")

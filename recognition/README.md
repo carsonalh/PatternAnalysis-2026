@@ -144,7 +144,7 @@ TimeGAN resources:
   per-process VRAM usage was unavailable, but overall usage remained constant
   throughout training.
 * Total model parameters: 1,859,113.
-* Training time (on Nvidia RTX 5070 GPU): 
+* Training time (on Nvidia RTX 5070 GPU): ~950s.
 
 Compared to baseline, stacked LSTM resources:
 

@@ -29,3 +29,8 @@ def evaluate(training, validation, predicted):
             "midpoint_kl": divergences[0], "feature_kl": divergences,
             "depth_ssim": float(raw_ssim), "log_depth_ssim": float(log_ssim),
             "kl_target_met": bool(np.mean(divergences) < 0.1), "ssim_target_met": bool(raw_ssim > 0.6)}
+
+
+if __name__ == "__main__":
+    # TODO measure KL divergence between spread and mid-price returns
+    raise NotImplemented

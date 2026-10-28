@@ -1,7 +1,5 @@
 # Limit Order Book Generation using TimeGAN
 
-<!-- A description of the algorithm and the problem that it solves (approximately a paragraph), how it works in a paragraph, and a figure/visualisation. -->
-
 ## Algorithm and problem description
 
 Our goal is to generate realistic sequences of limit order book data, particularly for the trading of an equity stock.
@@ -23,15 +21,16 @@ The generator RNN generates vectors in this latent space (rather than in the fea
 The discriminator network is then trained to discriminate between the latent representations of these two processes.
 Moreover, there is also a supervisor RNN trained to predict the next latent vector.
 
-<!-- TODO cite TimeGAN paper somewhere here. -->
-
-The original TimeGAN paper details the separation of time-series data into static and temporal features.
+The original TimeGAN paper (accessible using [this hyperlink](https://papers.nips.cc/paper/2019/file/c9efe5f26cd17ba6216bbe2a7d26d490-Paper.pdf))
+details the separation of time-series data into static and temporal features.
 However, we discard any notion of "static" feature training as our whole dataset comprises of one dataset which is a single time series.
 Therefore, our relevant "static" features are already fixed, so there is no need to include them in this analysis.
 
-<!-- TODO some plots showing predictions of the TimeGAN -->
-
 ## Figure/visualisation
+
+Some long-running predictions from the TimeGAN at the beginning of the validation set.
+
+![Predictions vs validation data](./predictions.png)
 
 ## Feasibility review
 
@@ -75,9 +74,7 @@ understanding for stakeholders and researchers. A workable fallback that
 addresses this is to use a stacked LSTM model which predicts an axis-aligned
 gaussian distribution of the next feature vector. This can be both used as a
 point-predictive model (by just choosing the mean), or as a generative model
-(by repeatedly sampling the distribution). To simplify this even further, we
-can ignore midpoint prices totally by just sampling the aforementioned Wiener
-process directly, so we shall always have plausible midpoint price returns.
+(by repeatedly sampling the distribution).
 
 Given the relative low-dimensionality of the data, we expect that the model
 should be small and able to run on most modern commercially-available GPUs, so
@@ -99,13 +96,7 @@ corporate liabilities. Journal of Political Economy, (81(3)), 637-654.
 3. Scripts in this directory can be run using the command `uv run`, followed by
    the name of the script. E.g. `uv run train.py` will run `train.py`.
 
-## Example inputs, outputs, and visual plots
-
-<!-- Example inputs, outputs, and visual plots of your algorithm. -->
-
 ## Pre-processing and data splits
-
-<!-- Description of any specific pre-processing used, with references if any. Justify your training, validation, and testing splits of the data. -->
 
 In order to enforce validity of all generated order books, a feature space which is constrained to encode order books that meet our prior invariants.
 
@@ -135,20 +126,73 @@ I.e., multiple varied completions of the training set can be generated, none of 
 
 ### Quantitative benchmarking
 
-<!-- Quantitative benchmarking of your chosen model against your implemented baseline model under identical evaluation splits. -->
+Despite introducing a KL loss term to TimeGAN, target KL loss of 0.1 was not able to be achieved.
+
+* TimeGAN KL loss of log returns: 1.55.
+* Baseline LSTM KL loss of log returns: 0.69.
+
+Due to a strong mode of zero in the dataset, getting KL divergence to be reduced posed challenges.
+For instance, the baseline model predicted a distribution of the next data point which was gaussian.
+However, with long runs of zeros, even a tight gaussian distribution would inevitably have some variability in it.
 
 ### Resource profiling
 
-<!-- Resource profiling table documenting computational efficiency (peak GPU VRAM, parameter count, and inference runtime/latency). -->
+TimeGAN resources:
 
-### Qualitative error autopsies
+* Training VRAM: < 4GiB. Measured using `nvidia-smi` while the program was
+  running. Due to programming environment (WSL), exact information about
+  per-process VRAM usage was unavailable, but overall usage remained constant
+  throughout training.
+* Total model parameters: 1,859,113.
+* Training time (on Nvidia RTX 5070 GPU): 
 
-<!-- In-depth qualitative error autopsies analyzing 3–5 representative failure cases from the dataset (diagnosing root triggers and failure modes). -->
+Compared to baseline, stacked LSTM resources:
 
-### Engineering recommendation and trade-off synthesis
+* Training VRAM: < 1.5GiB.
+* Parameters: 229,456.
+* Training time: ~90s.
 
-<!-- Actionable engineering recommendation and trade-off synthesis for your project manager. -->
+### Engineering Recommendation and Trade-Offs
+
+While both the baseline stacked LSTM and TimeGAN models show great potential,
+the simpler LSTM model was more adaptable, more stable to train, simpler to
+program and less compute intensive, so the engineer authoring this review would recommend it over TimeGAN.
+A particular struggle using TimeGAN was the introduction of a latent space.
+This complicated training, made various results less interprable, and in turn allowed the researcher less flexibility in enforcing domain constraints.
+A qualitative example of this can be seen with predictions from each model at a small scale (example plots below).
+As previously mentioned a feature of the dataset is a strong mode of zero (due to midpoint prices remaining stagnant for brief moments in time, while best-ask and best-bid prices contain large volumes).
+The LSTM model, having the ability to directly output values in the feature space, can produce these trends.
+
+TimeGAN close-up predictions:
+
+![TimeGAN predictions close-up](./predictions_closeup.png)
+
+LSTM close-up predictions:
+
+![LSTM predictions close-up](./lstm_predictions.png)
+
+Technically, for the patterns of the training data to "imprint" themselves on
+the generator, they must first be learned by the encoder, then, by
+backpropagation, be learned by the discriminator, and by a second pass of
+backpropagation, be finally learned by the generator, which produces replicated results.
+This is one step more abstracted from the data than even a traditional GAN, as
+patterns pass through two other models in a feature space foreign to that of
+the processed data.
+
+Concerning order structure, the models (they each use the same feature space)
+do not produce any crossed order books, non-monotonic prices or otherwise
+invalid books due to the domain-constrained encoding in the feature space.
+So stakeholders concerned about this kind of invalidity can know that it is not possible once features are decoded.
 
 ## Artificial Intelligence Usage Disclosure
 
-<!-- The mandatory Artificial Intelligence Usage Disclosure subsection (see Section 6) -->
+Generative artifical intelligence was used in the making of this assignment.
+The models used included OpenAI's GPT-5.3 Luna, GPT-6 Luna, GPT-6.1 Sol,
+GPT-5.3 Sol using the agentic Opencode and Codex coding tools.
+
+The use of these tools included code generation, debugging and research.
+
+All final code has been reviewed and/or re-written by hand, and contents of
+this README, including the feasibility review, were also written without these
+tools (aside from using an LLM to create a template of the README, comprising
+of section titles and HTML/Markdown comments within the file).

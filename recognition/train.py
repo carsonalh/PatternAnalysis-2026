@@ -12,76 +12,13 @@ from modules import LATENT_DIMS
 from timegan import TimeGAN
 
 
-def fit(data, steps=(1000, 1000, 5000), window=64, batch_size=64, seed=20261025):
-    torch.manual_seed(seed)
-    torch.set_num_threads(4)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    features = data.clone()
-    features[:, 0] = torch.diff(data[:, 0], prepend=data[:1, 0])
-    center, scale = features.mean(0), features.std(0).clamp_min(1e-8)
-    values = ((features - center) / scale).float().to(device)
-    model = TimeGAN().to(device)
-    encoder, decoder, generator, supervisor, discriminator = (
-        model.encoder, model.decoder, model.generator, model.supervisor, model.discriminator)
-    modules = ((encoder, decoder), (supervisor,), (generator, supervisor), (discriminator,))
-    optimizers = [torch.optim.Adam(chain(*(m.parameters() for m in group)), lr=1e-3) for group in modules]
-    history = []
-
-    def update(loss, optimizer):
-        model.zero_grad(set_to_none=True)
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Non-finite training loss")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_((p for group in optimizer.param_groups for p in group['params']), 1.0)
-        optimizer.step()
-
-    def losses(x):
-        h, e = model.encode(x), generator(torch.randn(len(x), window, model._latent_dims, device=device))
-        fake = supervisor(e)
-        supervised = F.mse_loss(supervisor(h)[:, :-1], h[:, 1:])
-        reconstruction = F.mse_loss(model.decode(h), x)
-        synthetic = model.decode(fake)
-        moments = (synthetic.mean((0, 1)) - x.mean((0, 1))).abs().mean()
-        moments = moments + ((synthetic.var((0, 1), unbiased=False) + 1e-6).sqrt() - (x.var((0, 1), unbiased=False) + 1e-6).sqrt()).abs().mean()
-        real_logits, fake_logits, noise_logits = (discriminator(z) for z in (h, fake, e))
-        bce = F.binary_cross_entropy_with_logits
-        adversarial = bce(fake_logits, torch.ones_like(fake_logits)) + bce(noise_logits, torch.ones_like(noise_logits))
-        discrimination = bce(real_logits, torch.ones_like(real_logits)) + bce(fake_logits, torch.zeros_like(fake_logits)) + bce(noise_logits, torch.zeros_like(noise_logits))
-        return reconstruction, supervised, adversarial + 100 * (supervised + 1e-8).sqrt() + 100 * moments, discrimination
-
-    # Minibatch windows train the networks; prediction later embeds the entire history.
-    for stage, count in enumerate(steps):
-        for step in range(count):
-            starts = torch.randint(len(values) - window + 1, (batch_size,), device=device)
-            x = values[starts[:, None] + torch.arange(window, device=device)]
-            if stage == 0:
-                loss = 10 * (F.mse_loss(model.decode(model.encode(x)), x) + 1e-8).sqrt()
-                update(loss, optimizers[0])
-            elif stage == 1:
-                h = model.encode(x).detach()
-                loss = F.mse_loss(supervisor(h)[:, :-1], h[:, 1:])
-                update(loss, optimizers[1])
-            else:
-                reconstruction, supervised, loss, _ = losses(x)
-                update(loss, optimizers[2])
-                reconstruction, supervised, _, _ = losses(x)
-                update(10 * (reconstruction + 1e-8).sqrt() + 0.1 * supervised, optimizers[0])
-                _, _, _, discrimination = losses(x)
-                if discrimination.item() > 0.15:
-                    update(discrimination, optimizers[3])
-            if step % 100 == 0 or step == count - 1:
-                history.append({"stage": stage, "step": step + 1, "loss": loss.item()})
-                print(history[-1], flush=True)
-    return model.eval(), values, center, scale, history
-
-
 def pre_train(
     dataset: WindowDataset,
     *,
     epochs: int = 20,
     device: torch.types.Device = "cuda",
     dtype: torch.dtype = torch.float32,
-    filename: str = "pretrained.pth",
+    filename: str = "pretrained_returns.pth",
     seed: int = 0,
 ) -> TimeGAN:
     if filename:
@@ -89,7 +26,8 @@ def pre_train(
         if path.is_file():
             print("Loading pre-trained model from fs cache")
             with open(path, "rb") as f:
-                return torch.load(f, weights_only=False)
+                model = torch.load(f, map_location=device, weights_only=False)
+            return model
 
     torch.manual_seed(seed)
 
@@ -120,7 +58,7 @@ def pre_train(
 
             batch_losses.append((10 * recon_loss.sqrt()).item())
 
-        print(f"Finished training epoch {epoch + 1}; recon. loss (batch mean): {np.mean(batch_losses)}")
+        print(f"Finished training epoch {epoch + 1}; recon. loss (batch mean): {np.mean(batch_losses):.4f}")
 
     print("Begin supervisor pre-training")
     for epoch in range(epochs):
@@ -141,7 +79,7 @@ def pre_train(
             supervisor_optim.step()
 
             batch_losses.append((10 * pred_loss.sqrt()).item())
-        print(f"Finished training epoch {epoch + 1}; supervised loss (batch mean): {np.mean(batch_losses)}")
+        print(f"Finished training epoch {epoch + 1}; supervised loss (batch mean): {np.mean(batch_losses):.4f}")
 
     with open(filename, "wb") as f:
         torch.save(model, f)
@@ -150,12 +88,28 @@ def pre_train(
 
     return model
 
-def train(dataset: WindowDataset) -> None:
-    epochs = 20
+def train(
+    dataset: WindowDataset,
+    *,
+    epochs: int = 20,
+    filename: str = "timegan_returns.pth",
+    balance: float | None = None,
+    smoothing: float = 0.0,
+    balance_total: bool = False,
+    max_streak: int | None = None,
+    pretrain_filename: str = "pretrained_returns.pth",
+    pretrain_epochs: int = 20,
+) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
-    model = pre_train(dataset, device=device, dtype=dtype)
+    model = pre_train(
+        dataset,
+        device=device,
+        dtype=dtype,
+        epochs=pretrain_epochs,
+        filename=pretrain_filename,
+    )
 
     torch.manual_seed(0)
 
@@ -166,17 +120,24 @@ def train(dataset: WindowDataset) -> None:
 
     gen_optim = torch.optim.Adam(chain(model.generator.parameters(), model.supervisor.parameters()), lr=3e-4)
     recon_optim = torch.optim.Adam(chain(model.encoder.parameters(), model.decoder.parameters()), lr=3e-4)
-    dis_optim = torch.optim.Adam(model.discriminator.parameters(), lr=3e-4)
+    dis_optim = torch.optim.Adam(model.discriminator.parameters(), lr=1e-4)
+    previous, rates, streak = None, np.ones(2), 0
 
     for epoch in range(epochs):
         dis_batch_losses: list[float] = []
         gen_batch_losses: list[float] = []
+        gen_components: list[tuple[float, float, float]] = []
+        updates = [0, 0]
         for batch, labels in data_loader:
             batch = batch.to(device, dtype)
             labels = labels.to(device, dtype)
             both_windows = torch.cat((batch, labels[:, None, :]), dim=1)
+            update_generator = balance is None or rates[1] <= balance * rates[0] or (previous is not None and previous[1] <= 0.15)
+            if balance is not None and max_streak is not None and abs(streak) >= max_streak:
+                update_generator = streak < 0 or (previous is not None and previous[1] <= 0.15)  # Respect D pauses.
+            streak = max(streak, 0) + 1 if update_generator else min(streak, 0) - 1
 
-            # Two generator/autoencoder update pairs precede each discriminator update.
+            # Keep two autoencoder updates; use G when TimeGAN already pauses D below 0.15.
             for _ in range(2):
                 with torch.no_grad():
                     h = model.encode(both_windows)
@@ -202,9 +163,14 @@ def train(dataset: WindowDataset) -> None:
                 moment_loss = moment_loss + (fake_std - real_std).abs().mean()
                 gen_loss = adv_gen_loss + 100 * (supervised_loss + 1e-8).sqrt() + 100 * moment_loss
                 model.zero_grad()
-                gen_loss.backward()
-                gen_optim.step()
+                if update_generator:
+                    gen_loss.backward()
+                    gen_optim.step()
+                    updates[0] += 1
                 gen_batch_losses.append(gen_loss.item())
+                # Log weighted contributions so their sum matches the generator total.
+                gen_components.append((adv_gen_loss.item(), 100 * (supervised_loss.item() + 1e-8) ** 0.5,
+                                       100 * moment_loss.item()))
 
                 # Recompute embeddings after the supervisor update, retaining encoder gradients.
                 h = model.encode(both_windows)
@@ -224,33 +190,48 @@ def train(dataset: WindowDataset) -> None:
             with torch.no_grad():
                 e_fake = model.generator(torch.randn(*batch.shape[:2], LATENT_DIMS, device=device, dtype=dtype))
                 h_fake = model.supervisor(e_fake)
+            fake_probability = model.discriminate(h_fake)
             adv_dis_loss_fake = F.binary_cross_entropy(
-                model.discriminate(h_fake),
+                fake_probability,
                 torch.zeros(*batch.shape[:2], 1, device=device, dtype=dtype),
             )
 
+            noise_probability = model.discriminate(e_fake)
             adv_dis_loss_fake_e = F.binary_cross_entropy(
-                model.discriminate(e_fake),
+                noise_probability,
                 torch.zeros(*batch.shape[:2], 1, device=device, dtype=dtype),
             )
 
             adv_dis_loss = adv_dis_loss_real + adv_dis_loss_fake + adv_dis_loss_fake_e
             dis_optim.zero_grad()
-            if adv_dis_loss.item() > 0.15:
+            if adv_dis_loss.item() > 0.15 and (balance is None or not update_generator):
                 adv_dis_loss.backward()
                 dis_optim.step()
+                updates[1] += 1
 
             dis_batch_losses.append(adv_dis_loss.item() / 3)
+            if balance is not None:
+                # BCE adaptation of arXiv:2008.12463: D updates when r_D > lambda * r_G.
+                paired_adversarial = (F.binary_cross_entropy(fake_probability.detach(), torch.ones_like(fake_probability))
+                                      + F.binary_cross_entropy(noise_probability.detach(), torch.ones_like(noise_probability)))
+                current = np.array((gen_loss.item() if balance_total else paired_adversarial.item(), adv_dis_loss.item()))
+                if previous is not None:
+                    change = np.abs(current - previous) / np.maximum(np.abs(previous), 1e-8)
+                    rates = smoothing * rates + (1 - smoothing) * change
+                previous = current
 
-        print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses)}; gen. loss (batch mean): {np.mean(gen_batch_losses)}")
+        adversarial, supervised, moment = np.mean(gen_components, axis=0)
+        print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses):.4f}; "
+              f"gen. loss (batch mean): {np.mean(gen_batch_losses):.4f}; adversarial: {adversarial:.4f}; "
+              f"supervised (weighted): {supervised:.4f}; moment (weighted): {moment:.4f}; G/D updates: {updates[0]}/{updates[1]}", flush=True)
 
-    torch.save(model, "timegan.pth")
+    torch.save(model, filename)
 
 if __name__ == "__main__":
-    # First standardize dataset
     data = LOBSTERLevel10Dataset(train=True).data
-    mean, std = data.mean(0), data.std(0).clamp_min(1e-3)
-    data = (data.clone() - mean[None, ...]) / std[None, ...]
+
+    train_mean, train_std = data.mean(0), data.std(0).clamp_min(1e-8)
+    data = (data - train_mean) / train_std
 
     dataset = WindowDataset(data)
-    train(dataset)
+    train(dataset, filename="timegan_returns.pth", pretrain_filename="pretrained_returns.pth")

@@ -50,30 +50,6 @@ def load_dfs() -> tuple[pd.DataFrame, pd.DataFrame]:
     return books, messages
 
 
-def sample_order_book(books: pd.DataFrame, messages: pd.DataFrame,
-                      interval_seconds: float) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Previous-tick snapshots on a clock grid; never select a future event.
-
-    Empty intervals carry the latest book forward. For simultaneous messages,
-    the last row is the book after all events at that timestamp.
-    """
-    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
-        raise ValueError("Sampling interval must be finite and positive")
-    if len(books) != len(messages) or len(books) < 2 or "time" not in messages:
-        raise ValueError("Sampling requires aligned books and event timestamps")
-    times = messages["time"].to_numpy(dtype=float)
-    if not np.isfinite(times).all() or (np.diff(times) < 0).any():
-        raise ValueError("Event timestamps must be finite and nondecreasing")
-    first = int(np.ceil(times[0] / interval_seconds))
-    last = int(np.floor(times[-1] / interval_seconds))
-    grid = np.arange(first, last + 1) * interval_seconds
-    grid = grid[(grid >= times[0]) & (grid <= times[-1])]
-    if len(grid) < 2:
-        raise ValueError("Sampling must leave at least two snapshots")
-    source_indices = np.searchsorted(times, grid, side="right") - 1
-    return books.iloc[source_indices].reset_index(drop=True), grid, source_indices
-
-
 class LOBSTERLevel10Dataset(Dataset, Sequence):
     _VALIDATION_RATIO: Final[float] = 0.15
 

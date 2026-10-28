@@ -8,8 +8,7 @@ import numpy as np
 
 from torch.utils.data import DataLoader
 from dataset import LOBSTERLevel10Dataset, WindowDataset
-from modules import LATENT_DIMS
-from timegan import TimeGAN
+from modules import LATENT_DIMS, TimeGAN
 
 
 def pre_train(

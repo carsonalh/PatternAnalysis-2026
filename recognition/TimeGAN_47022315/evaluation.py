@@ -19,6 +19,16 @@ def kl_divergence(validation_values, predicted_values, bins: int = 50) -> float:
     return float(np.sum(p * np.log(p / q)))
 
 
+def absolute_return_autocorrelation(returns) -> float:
+    """Pearson lag-1 autocorrelation of absolute midpoint log returns."""
+    values = np.abs(np.asarray(returns, dtype=float).ravel())
+    if values.size < 2 or not np.isfinite(values).all():
+        raise ValueError("Returns must contain at least two finite values.")
+    if values[:-1].std() == 0 or values[1:].std() == 0:
+        return float("nan")
+    return float(np.corrcoef(values[:-1], values[1:])[0, 1])
+
+
 def depth_ssim(actual_depth, predicted_depth) -> float:
     """Global SSIM for mean bid/ask volume profiles across the ten levels."""
     actual, predicted = (np.asarray(x, dtype=float) for x in (actual_depth, predicted_depth))
@@ -87,27 +97,42 @@ if __name__ == "__main__":
     torch.set_num_threads(4)
     torch.manual_seed(0)
     split_name = "test" if args.test else "validation"
-    evaluation_data = LOBSTERLevel10Dataset(split=split_name)
-    warmup_data = LOBSTERLevel10Dataset(split="validation" if args.test else "train")
+    training_data = LOBSTERLevel10Dataset(split="train")
+    validation_data = LOBSTERLevel10Dataset(split="validation")
+    test_data = LOBSTERLevel10Dataset(split="test")
+    split_data = {"validation": validation_data, "test": test_data}
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
 
     books, _ = load_dfs()
+    midpoint = 0.5 * (books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy())
+    training_returns = np.diff(np.log(midpoint))[:len(training_data)]
     transition_count = len(books) - 1
-    train_end = round(evaluation_data._train_ratio * transition_count)
-    validation_end = round((evaluation_data._train_ratio + evaluation_data._VALIDATION_RATIO) * transition_count)
+    train_end = round(training_data._train_ratio * transition_count)
+    validation_end = round((training_data._train_ratio + training_data._VALIDATION_RATIO) * transition_count)
+    predictions, generation_times, warmups = {}, {}, {}
+    for name, evaluation_data in split_data.items():
+        warmup_data = training_data if name == "validation" else validation_data
+        actual = evaluation_data.data[:, 0].numpy()
+        context = warmup_data.data[-WARMUP_SIZE:].to(next(model.parameters())).unsqueeze(0)
+        warmup = context.size(1)
+
+        torch.manual_seed(0)
+        generation_start = time.perf_counter()
+        with torch.inference_mode():
+            noise = torch.randn(1, warmup + len(actual), model._latent_dims,
+                                dtype=context.dtype, device=context.device)
+            synthetic = model.generator(noise)[:, warmup:]
+            latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
+            predictions[name] = model.decode(latent)[:, warmup:][0].double().cpu().numpy()
+        generation_times[name] = time.perf_counter() - generation_start
+        warmups[name] = warmup
+
+    evaluation_data = split_data[split_name]
+    predicted = predictions[split_name]
+    generation_seconds, warmup = generation_times[split_name], warmups[split_name]
+    actual = evaluation_data.data[:, 0].numpy()
     begin, end = (validation_end, transition_count) if args.test else (train_end, validation_end)
     actual_books = books.iloc[begin + 1:end + 1]
-    actual = evaluation_data.data[:, 0].numpy()
-    context = warmup_data.data[-WARMUP_SIZE:].to(next(model.parameters())).unsqueeze(0)
-    warmup = context.size(1)
-
-    generation_start = time.perf_counter()
-    with torch.inference_mode():
-        noise = torch.randn(1, warmup + len(actual), model._latent_dims, dtype=context.dtype, device=context.device)
-        synthetic = model.generator(noise)[:, warmup:]
-        latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
-        predicted = model.decode(latent)[:, warmup:][0].double().cpu().numpy()
-    generation_seconds = time.perf_counter() - generation_start
 
     actual_asks, actual_bids, actual_ask_sizes, actual_bid_sizes = book_arrays(actual_books)
     initial_midpoint = 0.5 * (books["ASKp1"].iloc[begin] + books["BIDp1"].iloc[begin])
@@ -123,6 +148,12 @@ if __name__ == "__main__":
     print(f"Generation latency (including warm-up): {generation_seconds:.3f}s; "
           f"{1_000 * generation_seconds / len(predicted):.3f} ms/event; "
           f"throughput {len(predicted) / generation_seconds:.1f} events/s")
+    print(f"Training |return| lag-1 autocorrelation: {absolute_return_autocorrelation(training_returns):.6f}")
+    for name in ("validation", "test"):
+        raw_predicted_returns = (predictions[name][:, 0] * split_data[name].std[0].item()
+                                 + split_data[name].mean[0].item())
+        print(f"Predicted {name} |return| lag-1 autocorrelation: "
+              f"{absolute_return_autocorrelation(raw_predicted_returns):.6f}")
     print(f"Mid-price return KL({split_name} || predicted): {kl_divergence(actual, predicted[:, 0]):.6f} nats (50 bins)")
     print(f"Spread KL({split_name} || predicted): {kl_divergence(actual_spread, predicted_spread):.6f} nats (50 bins)")
     print(f"Mean depth-profile SSIM: {depth_ssim(actual_depth, predicted_depth):.6f}")

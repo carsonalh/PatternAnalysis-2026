@@ -11,6 +11,46 @@ from dataset import LOBSTERLevel10Dataset, WindowDataset
 from modules import LATENT_DIMS, TimeGAN
 
 
+def save_training_curves(history: dict[str, list[float]], filename: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    epochs = np.arange(1, len(history["generator"]) + 1)
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for name in ("generator", "discriminator"):
+        axes[0].plot(epochs, history[name], label=name.title())
+    axes[0].set_title("Total losses")
+    axes[0].set_ylabel("Batch mean")
+    axes[0].legend()
+    for name in ("adversarial", "supervised", "moment"):
+        axes[1].plot(epochs, history[name], label=name.title())
+    axes[1].set_title("Generator loss terms")
+    axes[1].legend()
+    axes[2].plot(epochs, history["midpoint_kl"], label="Midpoint KL")
+    axes[2].set_title("Midpoint return distribution")
+    axes[2].legend()
+    for axis in axes:
+        axis.set_xlabel("Epoch")
+        axis.grid(alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(filename, dpi=150)
+    plt.close(figure)
+
+
+def save_pretraining_curves(reconstruction: list[float], supervision: list[float], filename: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for axis, values, title in zip(
+        axes, (reconstruction, supervision), ("Autoencoder reconstruction", "Supervisor prediction"),
+    ):
+        axis.plot(np.arange(1, len(values) + 1), values)
+        axis.set(title=title, xlabel="Epoch", ylabel="Batch mean loss")
+        axis.grid(alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(filename, dpi=150)
+    plt.close(figure)
+
+
 def soft_histogram(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
     """Soft bin probabilities; sigmoid boundaries give gradients and open tails."""
     cdf = torch.sigmoid((edges[1:-1] - values.reshape(-1, 1)) / (1e-2 * (edges[1] - edges[0])))
@@ -49,6 +89,8 @@ def pre_train(
 
     batch: torch.Tensor
     labels: torch.Tensor
+    reconstruction_losses: list[float] = []
+    supervision_losses: list[float] = []
 
     print("Beginning auto-encoder pre-training")
     for epoch in range(epochs):
@@ -65,7 +107,9 @@ def pre_train(
 
             batch_losses.append((10 * recon_loss.sqrt()).item())
 
-        print(f"Finished training epoch {epoch + 1}; recon. loss (batch mean): {np.mean(batch_losses):.4f}")
+        epoch_loss = float(np.mean(batch_losses))
+        reconstruction_losses.append(epoch_loss)
+        print(f"Finished training epoch {epoch + 1}; recon. loss (batch mean): {epoch_loss:.4f}")
 
     print("Begin supervisor pre-training")
     for epoch in range(epochs):
@@ -86,11 +130,16 @@ def pre_train(
             supervisor_optim.step()
 
             batch_losses.append((10 * pred_loss.sqrt()).item())
-        print(f"Finished training epoch {epoch + 1}; supervised loss (batch mean): {np.mean(batch_losses):.4f}")
+        epoch_loss = float(np.mean(batch_losses))
+        supervision_losses.append(epoch_loss)
+        print(f"Finished training epoch {epoch + 1}; supervised loss (batch mean): {epoch_loss:.4f}")
 
     with open(filename, "wb") as f:
         torch.save(model, f)
     print(f"Saved model to {filename}")
+    curve_path = Path(filename).with_name(f"{Path(filename).stem}_training_curves.png")
+    save_pretraining_curves(reconstruction_losses, supervision_losses, curve_path)
+    print(f"Saved pre-training curves to {curve_path}")
     print(f"Done pre-training")
 
     return model
@@ -135,6 +184,9 @@ def train(
     recon_optim = torch.optim.Adam(chain(model.encoder.parameters(), model.decoder.parameters()), lr=3e-4)
     dis_optim = torch.optim.Adam(model.discriminator.parameters(), lr=1e-4)
     previous, rates, streak = None, np.ones(2), 0
+    history = {name: [] for name in (
+        "generator", "discriminator", "adversarial", "supervised", "moment", "midpoint_kl"
+    )}
 
     for epoch in range(epochs):
         dis_batch_losses: list[float] = []
@@ -235,11 +287,17 @@ def train(
                 previous = current
 
         adversarial, supervised, moment, midpoint_kl = np.mean(gen_components, axis=0)
-        print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {np.mean(dis_batch_losses):.4f}; "
-              f"gen. loss (batch mean): {np.mean(gen_batch_losses):.4f}; adversarial: {adversarial:.4f}; "
+        discriminator, generator = np.mean(dis_batch_losses), np.mean(gen_batch_losses)
+        for name, value in zip(history, (generator, discriminator, adversarial, supervised, moment, midpoint_kl)):
+            history[name].append(float(value))
+        print(f"Finished training epoch {epoch + 1}; dis. loss (batch mean): {discriminator:.4f}; "
+              f"gen. loss (batch mean): {generator:.4f}; adversarial: {adversarial:.4f}; "
               f"supervised (weighted): {supervised:.4f}; moment (weighted): {moment:.4f}; midpoint KL (soft): {midpoint_kl:.4f}; G/D updates: {updates[0]}/{updates[1]}", flush=True)
 
     torch.save(model, filename)
+    curve_path = Path(filename).with_name(f"{Path(filename).stem}_training_curves.png")
+    save_training_curves(history, curve_path)
+    print(f"Saved training curves to {curve_path}")
 
 if __name__ == "__main__":
     torch.set_num_threads(4)

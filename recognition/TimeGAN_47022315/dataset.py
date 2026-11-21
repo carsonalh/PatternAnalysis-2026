@@ -6,7 +6,7 @@ from zipfile import ZipFile
 import torch
 from torch.utils.data import Dataset
 from collections.abc import Sequence
-from typing import Final
+from typing import Final, Literal
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -62,11 +62,20 @@ def positive_inverse(values: torch.Tensor) -> torch.Tensor:
 
 
 class LOBSTERLevel10Dataset(Dataset, Sequence):
+    # Data is split into train, validation, test (in that chronological order)
+    # Training ratio is computed from these two (see _train_ratio property)
     _VALIDATION_RATIO: Final[float] = 0.15
+    _TEST_RATIO: Final[float] = 0.15
 
-    def __init__(self, train: bool = True) -> None:
-        books, messages = load_dfs()
-        validation_begin = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO) * len(books))
+    @property
+    def _train_ratio(self) -> float:
+        assert 0 <= self._VALIDATION_RATIO <= 1 and 0 <= self._TEST_RATIO <= 1
+        assert self._VALIDATION_RATIO + self._TEST_RATIO < 1
+
+        return 1.0 - self._VALIDATION_RATIO - self._TEST_RATIO
+
+    def __init__(self, split: Literal["train", "validation", "test"] = "train") -> None:
+        books, _messages = load_dfs()
 
         ask_gaps = [positive_transform(books[f"ASKp{i}"] - books[f"ASKp{i - 1}"]).to_numpy() for i in range(2, 11)]
         bid_gaps = [positive_transform(books[f"BIDp{i - 1}"] - books[f"BIDp{i}"]).to_numpy() for i in range(2, 11)]
@@ -80,16 +89,23 @@ class LOBSTERLevel10Dataset(Dataset, Sequence):
         returns = self.data[1:, 0] - self.data[:-1, 0]
         self.data = self.data[1:].clone()
         self.data[:, 0] = returns
-        validation_begin -= 1
+        # We need two data points to form a difference, so we end up with len(books) - 1 total data points
+
+        validation_begin = round(self._train_ratio * len(self.data))
+        test_begin = round((self._train_ratio + self._VALIDATION_RATIO) * len(self.data))
 
         train_data = self.data[:validation_begin]
-        train_mean, train_std = train_data.mean(0), train_data.std(0).clamp_min(1e-8)
-        self.mean, self.std = train_mean, train_std
+        self.mean, self.std = train_data.mean(0), train_data.std(0).clamp_min(1e-8)
 
-        if train:
-            self.data = (self.data[:validation_begin] - train_mean) / train_std
-        else:
-            self.data = (self.data[validation_begin:] - train_mean) / train_std
+        match split:
+            case "train":
+                self.data = (self.data[:validation_begin] - self.mean) / self.std
+            case "validation":
+                self.data = (self.data[validation_begin:test_begin] - self.mean) / self.std
+            case "test":
+                self.data = (self.data[test_begin:] - self.mean) / self.std
+            case _:
+                raise AssertionError("invalid split name provided")
 
     def __len__(self) -> None:
         return len(self.data)

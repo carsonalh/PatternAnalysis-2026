@@ -30,7 +30,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
-    dataset = WindowDataset(LOBSTERLevel10Dataset(train=True).data, window_size=256)
+    dataset = WindowDataset(LOBSTERLevel10Dataset(split="train").data, window_size=256)
     data_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     model = GaussianLSTM().to(device, dtype)
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     window_size, num_windows, num_samples = dataset.window_size, 3, 3
     books, _ = load_dfs()
     log_midpoint = np.log((books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy()) / 2)
-    split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO) * len(books))
+    split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO - LOBSTERLevel10Dataset._TEST_RATIO) * len(books))
     training_returns = torch.from_numpy(np.diff(log_midpoint[:split]))
     return_mean, return_std = training_returns.mean(), training_returns.std().clamp_min(1e-8)
     context = dataset.data[-window_size:].unsqueeze(0).expand(num_samples, -1, -1).to(device, dtype)

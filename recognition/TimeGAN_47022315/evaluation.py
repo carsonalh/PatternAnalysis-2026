@@ -19,7 +19,7 @@ if __name__ == "__main__":
     torch.set_num_threads(4)
     torch.manual_seed(0)
     # Column 0 contains midpoint log returns; both use the same training scaler.
-    validation = LOBSTERLevel10Dataset(train=False).data[:, 0].numpy()
+    validation = LOBSTERLevel10Dataset(split="validation").data[:, 0].numpy()
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
     with torch.inference_mode():
         predicted = torch.cat([

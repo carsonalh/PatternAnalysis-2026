@@ -242,9 +242,8 @@ def train(
     torch.save(model, filename)
 
 if __name__ == "__main__":
-
     torch.set_num_threads(4)
-    data = LOBSTERLevel10Dataset(train=True).data
+    data = LOBSTERLevel10Dataset(split="train").data
     dataset = WindowDataset(data, window_size=512, stride=32)
 
     # The displayed validation plots used joint epoch 4 after both pretraining stages.

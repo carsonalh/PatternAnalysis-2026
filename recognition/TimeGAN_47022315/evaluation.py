@@ -1,4 +1,5 @@
 import argparse
+import time
 import numpy as np
 import torch
 from dataset import LOBSTERLevel10Dataset, load_dfs
@@ -100,11 +101,13 @@ if __name__ == "__main__":
     context = warmup_data.data[-WARMUP_SIZE:].to(next(model.parameters())).unsqueeze(0)
     warmup = context.size(1)
 
+    generation_start = time.perf_counter()
     with torch.inference_mode():
         noise = torch.randn(1, warmup + len(actual), model._latent_dims, dtype=context.dtype, device=context.device)
         synthetic = model.generator(noise)[:, warmup:]
         latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
         predicted = model.decode(latent)[:, warmup:][0].double().cpu().numpy()
+    generation_seconds = time.perf_counter() - generation_start
 
     actual_asks, actual_bids, actual_ask_sizes, actual_bid_sizes = book_arrays(actual_books)
     initial_midpoint = 0.5 * (books["ASKp1"].iloc[begin] + books["BIDp1"].iloc[begin])
@@ -117,6 +120,9 @@ if __name__ == "__main__":
     predicted_depth = np.stack((predicted_book[2].mean(axis=0), predicted_book[3].mean(axis=0)))
 
     print(f"Evaluating {split_name}: {len(actual)} events; warm-up: {'validation' if args.test else 'training'} ({warmup} events)")
+    print(f"Generation latency (including warm-up): {generation_seconds:.3f}s; "
+          f"{1_000 * generation_seconds / len(predicted):.3f} ms/event; "
+          f"throughput {len(predicted) / generation_seconds:.1f} events/s")
     print(f"Mid-price return KL({split_name} || predicted): {kl_divergence(actual, predicted[:, 0]):.6f} nats (50 bins)")
     print(f"Spread KL({split_name} || predicted): {kl_divergence(actual_spread, predicted_spread):.6f} nats (50 bins)")
     print(f"Mean depth-profile SSIM: {depth_ssim(actual_depth, predicted_depth):.6f}")

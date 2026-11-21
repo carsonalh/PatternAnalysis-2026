@@ -3,6 +3,10 @@ __pycache__
 *.pth
 *.png
 
+# Using some md files just to keep track of progress; not relevant for marker to see
+# Files like README.md are committed already so won't be ignored if changed.
+*.md
+
 data/
 notebooks/data/
 .ipynb_checkpoints/

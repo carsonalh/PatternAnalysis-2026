@@ -30,7 +30,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
-    dataset = WindowDataset(LOBSTERLevel10Dataset(split="train").data, window_size=256)
+    dataset = WindowDataset(LOBSTERLevel10Dataset(split="train").data, window_size=512, stride=4)
     data_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     model = GaussianLSTM().to(device, dtype)
@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch + 1}; NLL Loss: {np.mean(losses):.3f}")
 
-    window_size, num_windows, num_samples = dataset.window_size, 3, 3
+    window_size, num_events, num_samples = dataset.window_size, 1_500, 3
     books, _ = load_dfs()
     log_midpoint = np.log((books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy()) / 2)
     split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO - LOBSTERLevel10Dataset._TEST_RATIO) * len(books))
@@ -66,7 +66,7 @@ if __name__ == "__main__":
     with torch.inference_mode():
         # Warm up on training history, then feed sampled features back into the LSTM.
         state, sampled = None, []
-        for _ in range(num_windows * window_size):
+        for _ in range(num_events):
             hidden, state = model.lstm(context, state)
             mean, raw_std = model.linear(hidden[:, -1:]).chunk(2, dim=-1)
             context = torch.distributions.Normal(mean, F.softplus(raw_std).clamp_min(1e-6)).sample()
@@ -77,13 +77,18 @@ if __name__ == "__main__":
     print(f"KL(validation || predicted): {kl_divergence(actual_returns, returns.numpy()):.6f} nats "
           f"(50 bins; first {returns.size(1)} validation events)")
     actual = np.exp(log_midpoint[split:split + generated.shape[1]]) / 10000
+    warmup_history = np.exp(log_midpoint[split - window_size:split]) / 10000
+    warmup_x = np.arange(-len(warmup_history), 0)
+    validation_x = np.arange(len(actual))
     plt.figure(figsize=(10, 5))
-    plt.plot(actual, color="black", linewidth=2, label="Validation")
+    plt.axvspan(-window_size, 0, color="tab:blue", alpha=0.08, label="Warm-up period")
+    plt.plot(warmup_x, warmup_history, color="tab:blue", alpha=0.7, label="Warm-up history")
+    plt.plot(validation_x, actual, color="black", linewidth=2, label="Validation")
     for i, prices in enumerate(generated):
-        plt.plot(prices, alpha=0.75, label=f"GaussianLSTM sample {i + 1}")
+        plt.plot(validation_x, prices, alpha=0.75, label=f"GaussianLSTM sample {i + 1}")
     for boundary in range(window_size, generated.shape[1], window_size):
         plt.axvline(boundary - 0.5, color="gray", linestyle="--", alpha=0.5)
-    plt.xlabel("Validation event")
+    plt.xlabel("Event (warm-up history before validation)")
     plt.ylabel("Midpoint (USD)")
     plt.ticklabel_format(axis="y", style="plain", useOffset=False)
     plt.legend()

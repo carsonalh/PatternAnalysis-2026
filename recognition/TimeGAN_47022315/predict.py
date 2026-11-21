@@ -3,8 +3,9 @@ import numpy as np
 import torch
 from dataset import LOBSTERLevel10Dataset, load_dfs, positive_inverse
 
-WINDOW_SIZE = 1_000
+WINDOW_SIZE = 1_500
 WARMUP_SIZE = 512
+NUM_SAMPLES = 3
 
 
 if __name__ == "__main__":
@@ -19,10 +20,10 @@ if __name__ == "__main__":
     with torch.inference_mode():
         training = LOBSTERLevel10Dataset(split="train")
         context = training.data[-WARMUP_SIZE:].to(next(model.parameters()))
-        context = context.unsqueeze(0).expand(3, -1, -1)
+        context = context.unsqueeze(0).expand(NUM_SAMPLES, -1, -1)
         warmup = context.size(1)
         # Burn in the noise-only generator; real training history warms the supervisor and decoder.
-        noise = torch.randn(3, warmup + WINDOW_SIZE, model._latent_dims, dtype=context.dtype)
+        noise = torch.randn(NUM_SAMPLES, warmup + WINDOW_SIZE, model._latent_dims, dtype=context.dtype)
         synthetic = model.generator(noise)[:, warmup:]
         latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
         decoded = model.decode(latent)[:, warmup:].double()
@@ -34,11 +35,16 @@ if __name__ == "__main__":
         # Each sample starts from the last training midpoint; these are independent paths.
         generated = (log_midpoint[split - 1] + returns.cumsum(1)).exp().numpy() / 10000
     actual = np.exp(log_midpoint[split:split + WINDOW_SIZE]) / 10000
+    warmup_history = np.exp(log_midpoint[split - WARMUP_SIZE:split]) / 10000
+    warmup_x = np.arange(-len(warmup_history), 0)
+    validation_x = np.arange(len(actual))
     plt.figure(figsize=(10, 5))
-    plt.plot(actual, color="black", linewidth=2, label="Validation")
+    plt.axvspan(-WARMUP_SIZE, 0, color="tab:blue", alpha=0.08, label="Warm-up period")
+    plt.plot(warmup_x, warmup_history, color="tab:blue", alpha=0.7, label="Warm-up history")
+    plt.plot(validation_x, actual, color="black", linewidth=2, label="Validation")
     for i, prices in enumerate(generated):
-        plt.plot(prices, alpha=0.75, label=f"TimeGAN sample {i + 1}")
-    plt.xlabel("Validation event")
+        plt.plot(validation_x, prices, alpha=0.75, label=f"TimeGAN sample {i + 1}")
+    plt.xlabel("Event (warm-up history before validation)")
     plt.ylabel("Midpoint (USD)")
     plt.ticklabel_format(axis="y", style="plain", useOffset=False)
     plt.title(f"Log/exp: AMZN midpoint: first {WINDOW_SIZE} validation events")

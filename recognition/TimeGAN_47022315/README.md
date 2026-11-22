@@ -111,6 +111,8 @@ corporate liabilities. Journal of Political Economy, (81(3)), 637-654.
 2. In this (`recognition/`) directory, run `uv sync`.
 3. Scripts in this directory can be run using the command `uv run`, followed by
    the name of the script. E.g. `uv run train.py` will run `train.py`.
+   (Note for the script `evaluation.py` run it as `uv run evaluation.py` to evaluate over the validation set, and as
+   `uv run evaluation.py --test` to evaluate over the test set.)
 
 ## Pre-processing and data splits
 

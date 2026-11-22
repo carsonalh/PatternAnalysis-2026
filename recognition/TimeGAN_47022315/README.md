@@ -38,14 +38,6 @@ Loss plots:
 
 ![TimeGAN training curves](./timegan_training_curves.png)
 
-Full-depth predicted samples:
-
-![Reconstructed order-book sample 1](./predicted_order_book_sample_1.png)
-
-![Reconstructed order-book sample 2](./predicted_order_book_sample_2.png)
-
-![Reconstructed order-book sample 3](./predicted_order_book_sample_3.png)
-
 ## Feasibility review
 
 > Please note that the decision of an 85%-15% train-validation split has been
@@ -157,6 +149,33 @@ KL estimates use 50 equal-width bins defined from the training partition for eac
 Due to a strong mode of zero in the dataset, getting KL divergence to be reduced posed challenges.
 For instance, the baseline model predicted a distribution of the next data point which was gaussian.
 However, with long runs of zeros, even a tight gaussian distribution would inevitably have some variability in it.
+
+### Full order depth case studies
+
+Full-depth predicted samples shown below (different generated samples over the same validation period).
+
+![Reconstructed order-book sample 1](./predicted_order_book_sample_1.png)
+
+![Reconstructed order-book sample 2](./predicted_order_book_sample_2.png)
+
+![Reconstructed order-book sample 3](./predicted_order_book_sample_3.png)
+
+Qualitatively, it appears that the model succeeded in capturing a reasonable estimate of the spread, as well as gaps between each price to the next.
+The most obvious discrepancy comes with the log-returns.
+A likely reason for this is has to do with the strong mode of zero observed in the training data.
+I.e. as the midpoint moves somewhat infrequently, it often experiences long runs of zeros.
+This exact behaviour becomes difficult for the model to emulate due to outputting a continuous value.
+However, it is also clear that the overall movement, or 'drift' of this value, is fairly well calibrated,
+as it is able to capture the overall trend of stability (it oscillates around zero) and then moves in another direction,
+as we observe in the example validation data.
+
+Now observing the volume, in all samples we see the same pattern: we see spikes
+in the level-10 volumes, as shown in the validation period, but the overall
+volume of all levels is approximately halfway between the two different
+magnitudes seen in the validation period. This is likely due to using MSE loss,
+which favours being closest to the expected value of an uncertain data point,
+rather than a distribution/likelihood-based approach, where we rather
+incentivise values looking as though they are sampled from the distribution.
 
 ### Resource profiling
 

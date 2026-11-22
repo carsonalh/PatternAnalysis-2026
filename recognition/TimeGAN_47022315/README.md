@@ -177,6 +177,19 @@ which favours being closest to the expected value of an uncertain data point,
 rather than a distribution/likelihood-based approach, where we rather
 incentivise values looking as though they are sampled from the distribution.
 
+### Microstructure heatmap case studies
+
+These heatmaps compare actual and generated ask/bid depth across three
+1,500-event validation periods. The behaviour of volume being overly evenly
+spread across different price levels has already been discussed in the above
+section.
+
+![Microstructure case 1 depth heatmaps](./microstructure_case_1.png)
+
+![Microstructure case 2 depth heatmaps](./microstructure_case_2.png)
+
+![Microstructure case 3 depth heatmaps](./microstructure_case_3.png)
+
 ### Resource profiling
 
 TimeGAN resources:

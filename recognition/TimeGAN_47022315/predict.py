@@ -157,9 +157,10 @@ if __name__ == "__main__":
         actual_book = book_arrays(books.iloc[start_book + 1:start_book + window_size + 1])
         initial_midpoint = (books["ASKp1"].iloc[start_book] + books["BIDp1"].iloc[start_book]) / 2
         predicted_book = reconstruct_book(features.cpu().numpy(), training.mean.numpy(), training.std.numpy(), initial_midpoint)
-        plot_depth_heatmaps(actual_book, predicted_book, f"microstructure_case_{sample_number}.pdf", sample_number)
+        filename = f"microstructure_case_{sample_number}.png"
+        plot_depth_heatmaps(actual_book, predicted_book, filename, sample_number)
         actual_returns = np.diff(log_midpoint[start_book:start_book + window_size + 1])
         generated_returns = features[:, 0].cpu().numpy() * training.std[0].item() + training.mean[0].item()
         report_microstructure_case(actual_book, predicted_book, actual_returns, generated_returns, sample_number)
-        print(f"Saved microstructure_case_{sample_number}.pdf for validation events "
+        print(f"Saved {filename} for validation events "
               f"{period_start + 1}-{period_start + window_size}")

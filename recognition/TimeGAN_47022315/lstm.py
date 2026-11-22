@@ -40,12 +40,14 @@ def sample_features(
 
 if __name__ == "__main__":
     from dataset import LOBSTERLevel10Dataset, WindowDataset, load_dfs
-    from evaluation import (absolute_return_autocorrelation, book_arrays, depth_ssim,
-                            kl_divergence, reconstruct_book, structural_violation_rates)
+    from evaluation import (KL_BINS, absolute_return_autocorrelation, book_arrays, depth_ssim,
+                            kl_divergence, reconstruct_book, structural_violation_rates,
+                            training_kl_edges)
     from torch.utils.data import DataLoader
     import numpy as np
     import matplotlib.pyplot as plt
 
+    torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
@@ -83,6 +85,7 @@ if __name__ == "__main__":
     feature_mean = training_data.mean.numpy()
     feature_std = training_data.std.numpy()
     train_end = len(training_data)
+    return_edges, spread_edges = training_kl_edges(training_data)
     model.eval().cpu()
     predictions = {}
     for name, evaluation_data, warmup_data in (
@@ -111,13 +114,13 @@ if __name__ == "__main__":
               f"{1_000 * generation_seconds / generated_events:.3f} ms/event; "
               f"throughput {generated_events / generation_seconds:.1f} events/s")
         print(f"Mid-price return KL({name} || predicted): "
-              f"{kl_divergence(actual_features[:, 0], raw_predictions[:, :, 0]):.6f} nats "
-              f"(50 reference bins; {num_samples} paths)")
+              f"{kl_divergence(actual_features[:, 0], raw_predictions[:, :, 0], return_edges):.6f} nats "
+              f"({KL_BINS} training-defined bins; {num_samples} paths)")
         actual_spread = np.exp(np.clip(actual_features[:, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
         predicted_spread = np.exp(np.clip(raw_predictions[:, :, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
         print(f"Spread KL({name} || predicted): "
-              f"{kl_divergence(actual_spread, predicted_spread):.6f} nats "
-              f"(50 reference bins; {num_samples} paths)")
+              f"{kl_divergence(actual_spread, predicted_spread, spread_edges):.6f} nats "
+              f"({KL_BINS} training-defined bins; {num_samples} paths)")
         actual_returns = evaluation_data.data[:, 0].numpy() * feature_std[0] + feature_mean[0]
         generated_correlations = [absolute_return_autocorrelation(sample[:, 0]) for sample in raw_predictions]
         print(f"|return| lag-1 autocorrelation: actual {absolute_return_autocorrelation(actual_returns):.6f}; "

@@ -143,10 +143,12 @@ The two are separated such that the training set is chronologically first, the v
 
 Despite introducing a KL loss term to TimeGAN, target KL loss of 0.1 was not able to be achieved.
 
-* TimeGAN mid-price return KL (50 bins): 1.201405 nats (validation); 1.045288 nats (test).
-* TimeGAN spread KL (50 bins): 1.412363 nats (validation); 2.612912 nats (test).
-* Baseline LSTM mid-price return KL (50 bins): 0.785493 nats (validation); 0.874616 nats (test).
-* Baseline LSTM spread KL (50 bins): 0.097118 nats (validation); 0.270768 nats (test).
+KL estimates use 50 equal-width bins defined from the training partition for each metric, with open-ended outer bins; the same edges are used for both models and evaluation splits. The baseline LSTM was trained with random seed 0.
+
+* TimeGAN mid-price return KL: 0.738256 nats (validation); 0.750369 nats (test).
+* TimeGAN spread KL: 0.725173 nats (validation); 1.265459 nats (test).
+* Baseline LSTM mid-price return KL: 0.541497 nats (validation); 0.530057 nats (test).
+* Baseline LSTM spread KL: 0.133170 nats (validation); 0.300071 nats (test).
 * Mean depth-profile SSIM: 0.929437 (validation); 0.865365 (test).
 * Absolute log-return lag-1 autocorrelation: 0.261066 (training); 0.809915 (generated validation); 0.809918 (generated test).
 * Structural violation rates: 0.0000% for all reported categories on validation, test, and generated books.

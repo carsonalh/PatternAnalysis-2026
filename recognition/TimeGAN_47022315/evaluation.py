@@ -6,16 +6,36 @@ from dataset import LOBSTERLevel10Dataset, load_dfs
 
 WARMUP_SIZE = 512
 NUM_SAMPLES = 3
+KL_BINS = 50
 
 
-def kl_divergence(validation_values, predicted_values, bins: int = 50) -> float:
-    """Estimate KL(validation || predicted) in nats; samples must share a scale."""
-    actual, predicted = (np.asarray(x, dtype=float).ravel() for x in (validation_values, predicted_values))
+def kl_bin_edges(reference_values, bins: int = KL_BINS) -> np.ndarray:
+    """Create reference-derived bins with open tails for out-of-range samples."""
+    reference = np.asarray(reference_values, dtype=float).ravel()
+    if reference.size == 0 or not np.isfinite(reference).all() or bins < 1:
+        raise ValueError("Reference samples must be nonempty and finite; bins must be positive.")
+    edges = np.histogram_bin_edges(reference, bins=bins)
+    edges[[0, -1]] = (-np.inf, np.inf)
+    return edges
+
+
+def training_kl_edges(training_data, bins: int = KL_BINS) -> tuple[np.ndarray, np.ndarray]:
+    """Return fixed return and spread bins derived only from the training partition."""
+    normalized = training_data.data.detach().cpu().numpy()
+    physical = normalized * training_data.std.cpu().numpy() + training_data.mean.cpu().numpy()
+    spreads = np.exp(np.clip(physical[:, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
+    return kl_bin_edges(physical[:, 0], bins), kl_bin_edges(spreads, bins)
+
+
+def kl_divergence(reference_values, predicted_values, edges: np.ndarray) -> float:
+    """Estimate KL(reference || predicted) using explicitly shared bin edges."""
+    actual, predicted = (np.asarray(x, dtype=float).ravel() for x in (reference_values, predicted_values))
     if any(x.size == 0 or not np.isfinite(x).all() for x in (actual, predicted)):
         raise ValueError("Samples must be nonempty and finite.")
-    edges = np.histogram_bin_edges(actual, bins=bins)
-    edges[[0, -1]] = (-np.inf, np.inf)
-    # Reference-only bins are stable across models; overflow bins retain generated tails.
+    edges = np.asarray(edges, dtype=float)
+    if (edges.ndim != 1 or len(edges) < 2 or not np.all(np.diff(edges) > 0)
+            or not np.isneginf(edges[0]) or not np.isposinf(edges[-1])):
+        raise ValueError("Bin edges must be strictly increasing and include open tails.")
     p, q = (np.histogram(x, bins=edges)[0].astype(float) + 1e-8 for x in (actual, predicted))
     p, q = p / p.sum(), q / q.sum()
     return float(np.sum(p * np.log(p / q)))
@@ -102,6 +122,7 @@ if __name__ == "__main__":
     training_data = LOBSTERLevel10Dataset(split="train")
     validation_data = LOBSTERLevel10Dataset(split="validation")
     test_data = LOBSTERLevel10Dataset(split="test")
+    return_edges, spread_edges = training_kl_edges(training_data)
     split_data = {"validation": validation_data, "test": test_data}
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
 
@@ -158,8 +179,12 @@ if __name__ == "__main__":
     ]
     print(f"Generated {split_name} |return| lag-1 autocorrelation (mean of {len(predicted)} paths): "
           f"{np.mean(generated_autocorrelations):.6f}")
-    print(f"Mid-price return KL({split_name} || predicted): {kl_divergence(actual, physical_predicted[:, :, 0]):.6f} nats (50 reference bins)")
-    print(f"Spread KL({split_name} || predicted): {kl_divergence(actual_spread, predicted_spread):.6f} nats (50 reference bins)")
+    print(f"Mid-price return KL({split_name} || predicted): "
+          f"{kl_divergence(actual, physical_predicted[:, :, 0], return_edges):.6f} nats "
+          f"({KL_BINS} training-defined bins; shared across splits/models)")
+    print(f"Spread KL({split_name} || predicted): "
+          f"{kl_divergence(actual_spread, predicted_spread, spread_edges):.6f} nats "
+          f"({KL_BINS} training-defined bins; shared across splits/models)")
     print(f"Mean depth-profile SSIM: {depth_ssim(actual_depth, predicted_depth):.6f}")
     for name, sample in ((split_name.title(), (actual_asks, actual_bids, actual_ask_sizes, actual_bid_sizes)),
                          ("Generated", predicted_book)):

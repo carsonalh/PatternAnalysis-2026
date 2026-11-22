@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,9 +21,27 @@ class GaussianLSTM(nn.Module):
         return mu, F.softplus(sigma).clamp_min(1e-6)
 
 
+def sample_features(
+    model: GaussianLSTM,
+    warmup: torch.Tensor,
+    num_events: int,
+    num_samples: int,
+) -> torch.Tensor:
+    context = warmup.unsqueeze(0).expand(num_samples, -1, -1)
+    state, sampled = None, []
+    with torch.inference_mode():
+        for _ in range(num_events):
+            hidden, state = model.lstm(context, state)
+            mean, raw_std = model.linear(hidden[:, -1:]).chunk(2, dim=-1)
+            context = torch.distributions.Normal(mean, F.softplus(raw_std).clamp_min(1e-6)).sample()
+            sampled.append(context[:, 0, :])
+    return torch.stack(sampled, dim=1)
+
+
 if __name__ == "__main__":
     from dataset import LOBSTERLevel10Dataset, WindowDataset, load_dfs
-    from evaluation import kl_divergence
+    from evaluation import (absolute_return_autocorrelation, book_arrays, depth_ssim,
+                            kl_divergence, reconstruct_book, structural_violation_rates)
     from torch.utils.data import DataLoader
     import numpy as np
     import matplotlib.pyplot as plt
@@ -30,7 +49,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
-    dataset = WindowDataset(LOBSTERLevel10Dataset(split="train").data, window_size=512, stride=4)
+    training_data = LOBSTERLevel10Dataset(split="train")
+    validation_data = LOBSTERLevel10Dataset(split="validation")
+    test_data = LOBSTERLevel10Dataset(split="test")
+    dataset = WindowDataset(training_data.data, window_size=512, stride=4)
     data_loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     model = GaussianLSTM().to(device, dtype)
@@ -55,29 +77,64 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch + 1}; NLL Loss: {np.mean(losses):.3f}")
 
-    window_size, num_events, num_samples = dataset.window_size, 1_500, 3
+    window_size, num_samples = dataset.window_size, 3
     books, _ = load_dfs()
     log_midpoint = np.log((books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy()) / 2)
-    split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO - LOBSTERLevel10Dataset._TEST_RATIO) * len(books))
-    training_returns = torch.from_numpy(np.diff(log_midpoint[:split]))
-    return_mean, return_std = training_returns.mean(), training_returns.std().clamp_min(1e-8)
-    context = dataset.data[-window_size:].unsqueeze(0).expand(num_samples, -1, -1).to(device, dtype)
-    model.eval()
-    with torch.inference_mode():
-        # Warm up on training history, then feed sampled features back into the LSTM.
-        state, sampled = None, []
-        for _ in range(num_events):
-            hidden, state = model.lstm(context, state)
-            mean, raw_std = model.linear(hidden[:, -1:]).chunk(2, dim=-1)
-            context = torch.distributions.Normal(mean, F.softplus(raw_std).clamp_min(1e-6)).sample()
-            sampled.append(context[:, 0, 0])
-        returns = torch.stack(sampled, dim=1).cpu().double() * return_std + return_mean
-        generated = (log_midpoint[split - 1] + returns.cumsum(1)).exp().numpy() / 10000
-    actual_returns = np.diff(log_midpoint[split - 1:split + returns.size(1)])
-    print(f"KL(validation || predicted): {kl_divergence(actual_returns, returns.numpy()):.6f} nats "
-          f"(50 bins; first {returns.size(1)} validation events)")
-    actual = np.exp(log_midpoint[split:split + generated.shape[1]]) / 10000
-    warmup_history = np.exp(log_midpoint[split - window_size:split]) / 10000
+    feature_mean = training_data.mean.numpy()
+    feature_std = training_data.std.numpy()
+    train_end = len(training_data)
+    model.eval().cpu()
+    predictions = {}
+    for name, evaluation_data, warmup_data in (
+        ("validation", validation_data, training_data.data),
+        ("test", test_data, validation_data.data),
+    ):
+        warmup = warmup_data[-window_size:].cpu().to(dtype)
+        torch.manual_seed(0)
+        generation_start = time.perf_counter()
+        predicted = sample_features(model, warmup, len(evaluation_data), num_samples)
+        generation_seconds = time.perf_counter() - generation_start
+        predictions[name] = predicted.double().numpy()
+        raw_predictions = predictions[name] * feature_std + feature_mean
+        actual_features = evaluation_data.data[:, :2].numpy() * feature_std[:2] + feature_mean[:2]
+        split_begin = train_end if name == "validation" else train_end + len(validation_data)
+        actual_book = book_arrays(books.iloc[split_begin + 1:split_begin + 1 + len(evaluation_data)])
+        initial_midpoint = (books["ASKp1"].iloc[split_begin] + books["BIDp1"].iloc[split_begin]) / 2
+        generated_books = [reconstruct_book(sample, feature_mean, feature_std, initial_midpoint)
+                           for sample in predictions[name]]
+        generated_book = tuple(np.concatenate([book[index] for book in generated_books], axis=0)
+                               for index in range(4))
+        actual_depth = np.stack((actual_book[2].mean(axis=0), actual_book[3].mean(axis=0)))
+        generated_depth = np.stack((generated_book[2].mean(axis=0), generated_book[3].mean(axis=0)))
+        generated_events = num_samples * len(evaluation_data)
+        print(f"CPU generation latency for {num_samples} paths (including warm-up): {generation_seconds:.3f}s; "
+              f"{1_000 * generation_seconds / generated_events:.3f} ms/event; "
+              f"throughput {generated_events / generation_seconds:.1f} events/s")
+        print(f"Mid-price return KL({name} || predicted): "
+              f"{kl_divergence(actual_features[:, 0], raw_predictions[:, :, 0]):.6f} nats "
+              f"(50 reference bins; {num_samples} paths)")
+        actual_spread = np.exp(np.clip(actual_features[:, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
+        predicted_spread = np.exp(np.clip(raw_predictions[:, :, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
+        print(f"Spread KL({name} || predicted): "
+              f"{kl_divergence(actual_spread, predicted_spread):.6f} nats "
+              f"(50 reference bins; {num_samples} paths)")
+        actual_returns = evaluation_data.data[:, 0].numpy() * feature_std[0] + feature_mean[0]
+        generated_correlations = [absolute_return_autocorrelation(sample[:, 0]) for sample in raw_predictions]
+        print(f"|return| lag-1 autocorrelation: actual {absolute_return_autocorrelation(actual_returns):.6f}; "
+              f"generated mean {np.mean(generated_correlations):.6f}")
+        print(f"Mean depth-profile SSIM: {depth_ssim(actual_depth, generated_depth):.6f}")
+        for label, sample in (("Actual", actual_book), ("Generated", generated_book)):
+            rates = structural_violation_rates(*sample)
+            print(f"{label} structural violations (% of books): " + ", ".join(
+                f"{key} {100 * value:.4f}%" for key, value in rates.items()))
+
+    num_plot_events = min(1_500, len(validation_data))
+    generated = np.exp(
+        log_midpoint[train_end] + (predictions["validation"][:, :num_plot_events, 0] * feature_std[0]
+                                   + feature_mean[0]).cumsum(1)
+    ) / 10000
+    actual = np.exp(log_midpoint[train_end + 1:train_end + 1 + num_plot_events]) / 10000
+    warmup_history = np.exp(log_midpoint[train_end - window_size + 1:train_end + 1]) / 10000
     warmup_x = np.arange(-len(warmup_history), 0)
     validation_x = np.arange(len(actual))
     plt.figure(figsize=(10, 5))

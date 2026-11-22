@@ -2,7 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from dataset import LOBSTERLevel10Dataset, load_dfs, positive_inverse
-from evaluation import book_arrays, reconstruct_book
+from evaluation import (absolute_return_autocorrelation, book_arrays, depth_ssim,
+                        reconstruct_book, structural_violation_rates)
 
 WINDOW_SIZE = 1_500
 WARMUP_SIZE = 512
@@ -59,14 +60,46 @@ def plot_order_book_comparison(actual_book, predicted_book, filename: str, sampl
     plt.close(figure)
 
 
+def plot_depth_heatmaps(actual_book, predicted_book, filename: str, sample_number: int) -> None:
+    panels = (
+        (actual_book[2], "Actual ask depth"), (actual_book[3], "Actual bid depth"),
+        (predicted_book[2], "Generated ask depth"), (predicted_book[3], "Generated bid depth"),
+    )
+    vmax = max(values.max() for values, _ in panels)
+    figure, axes = plt.subplots(2, 2, figsize=(13, 7), sharex=True, sharey=True, layout="constrained")
+    for axis, (values, title) in zip(axes.flat, panels):
+        image = axis.imshow(values.T, origin="lower", aspect="auto", interpolation="nearest",
+                            vmin=0, vmax=vmax, cmap="magma")
+        axis.set(title=title, xlabel="Event", ylabel="Book level")
+        axis.set_yticks(np.arange(10), np.arange(1, 11))
+    figure.colorbar(image, ax=axes.ravel().tolist(), label="Displayed shares", shrink=0.85)
+    figure.suptitle(f"Microstructure case {sample_number}: {len(actual_book[2])}-event depth heatmaps")
+    figure.savefig(filename)
+    plt.close(figure)
+
+
+def report_microstructure_case(actual_book, predicted_book, actual_returns, generated_returns, sample_number: int) -> None:
+    actual_depth = np.stack((actual_book[2].mean(axis=0), actual_book[3].mean(axis=0)))
+    generated_depth = np.stack((predicted_book[2].mean(axis=0), predicted_book[3].mean(axis=0)))
+    side, level = np.unravel_index(np.abs(actual_depth - generated_depth).argmax(), actual_depth.shape)
+    rates = structural_violation_rates(*predicted_book)
+    print(f"Case {sample_number}: depth SSIM {depth_ssim(actual_depth, generated_depth):.4f}; "
+          f"largest mean-depth gap at {'ask' if side == 0 else 'bid'} level {level + 1} "
+          f"(actual {actual_depth[side, level]:.1f}, generated {generated_depth[side, level]:.1f} shares); "
+          f"|return| lag-1 autocorrelation actual/generated "
+          f"{absolute_return_autocorrelation(actual_returns):.4f}/{absolute_return_autocorrelation(generated_returns):.4f}; "
+          f"any structural violations {100 * rates['any']:.4f}%")
+
+
 if __name__ == "__main__":
     torch.set_num_threads(4)
     torch.manual_seed(0)
     books, _ = load_dfs()
     log_midpoint = np.log((books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy()) / 2)
     split = round((1 - LOBSTERLevel10Dataset._VALIDATION_RATIO - LOBSTERLevel10Dataset._TEST_RATIO) * (len(books) - 1))
-    window_size = min(WINDOW_SIZE, len(books) - split - 1)
     training = LOBSTERLevel10Dataset(split="train")
+    validation = LOBSTERLevel10Dataset(split="validation")
+    window_size = min(WINDOW_SIZE, len(validation.data))
     mean, std = training.mean[0], training.std[0]
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
     with torch.inference_mode():
@@ -102,13 +135,31 @@ if __name__ == "__main__":
     plt.legend()
     plt.tight_layout()
     plt.savefig("predictions_closeup.png", dpi=150)
-    actual_books = books.iloc[split + 1:split + 1 + len(actual)]
-    actual_book = book_arrays(actual_books)
-    initial_midpoint = 0.5 * (books["ASKp1"].iloc[split] + books["BIDp1"].iloc[split])
     for sample_number, features in enumerate(decoded, start=1):
-        predicted_book = reconstruct_book(
-            features.cpu().numpy(), training.mean.numpy(), training.std.numpy(), initial_midpoint,
-        )
         filename = f"predicted_order_book_sample_{sample_number}.png"
-        plot_order_book_comparison(actual_book, predicted_book, filename, sample_number)
+        initial_midpoint = 0.5 * (books["ASKp1"].iloc[split] + books["BIDp1"].iloc[split])
+        predicted_book = reconstruct_book(features.cpu().numpy(), training.mean.numpy(), training.std.numpy(), initial_midpoint)
+        plot_order_book_comparison(book_arrays(books.iloc[split + 1:split + 1 + window_size]),
+                                   predicted_book, filename, sample_number)
         print(f"Saved reconstructed order-book visualization to {filename}")
+
+    period_starts = np.linspace(0, len(validation.data) - window_size, NUM_SAMPLES, dtype=int)
+    for sample_number, period_start in enumerate(period_starts, start=1):
+        context_data = torch.cat((training.data, validation.data[:period_start]), dim=0)[-WARMUP_SIZE:]
+        context = context_data.to(next(model.parameters())).unsqueeze(0)
+        with torch.inference_mode():
+            torch.manual_seed(sample_number)
+            noise = torch.randn(1, WARMUP_SIZE + window_size, model._latent_dims, dtype=context.dtype)
+            synthetic = model.generator(noise)[:, WARMUP_SIZE:]
+            latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
+            features = model.decode(latent)[:, WARMUP_SIZE:][0].double()
+        start_book = split + period_start
+        actual_book = book_arrays(books.iloc[start_book + 1:start_book + window_size + 1])
+        initial_midpoint = (books["ASKp1"].iloc[start_book] + books["BIDp1"].iloc[start_book]) / 2
+        predicted_book = reconstruct_book(features.cpu().numpy(), training.mean.numpy(), training.std.numpy(), initial_midpoint)
+        plot_depth_heatmaps(actual_book, predicted_book, f"microstructure_case_{sample_number}.pdf", sample_number)
+        actual_returns = np.diff(log_midpoint[start_book:start_book + window_size + 1])
+        generated_returns = features[:, 0].cpu().numpy() * training.std[0].item() + training.mean[0].item()
+        report_microstructure_case(actual_book, predicted_book, actual_returns, generated_returns, sample_number)
+        print(f"Saved microstructure_case_{sample_number}.pdf for validation events "
+              f"{period_start + 1}-{period_start + window_size}")

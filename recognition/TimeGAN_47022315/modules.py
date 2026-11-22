@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataset import FEATURE_DIMS
+from constants import FEATURE_DIMS
 
 
 LATENT_DIMS = 128

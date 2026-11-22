@@ -32,7 +32,25 @@ Some predictions from the TimeGAN at the beginning of the validation set.
 
 ![Predictions vs validation data](./predictions.png)
 
+Loss plots:
+
+![TimeGAN pre-training curves](./pretrained_training_curves.png)
+
+![TimeGAN training curves](./timegan_training_curves.png)
+
+Full-depth predicted samples:
+
+![Reconstructed order-book sample 1](./predicted_order_book_sample_1.png)
+
+![Reconstructed order-book sample 2](./predicted_order_book_sample_2.png)
+
+![Reconstructed order-book sample 3](./predicted_order_book_sample_3.png)
+
 ## Feasibility review
+
+> Please note that the decision of an 85%-15% train-validation split has been
+> updated since the feasibility review was formally submitted to Turnitin, but
+> is left here for consistency with the other submission.
 
 We investigate the plausibility and efficacy of using deep learning models,
 particularly TimeGAN, as a method of generating plausible time series of equity
@@ -114,11 +132,8 @@ One limitation of this approach, is that if the midpoint price approaches zero, 
 In practice, no issues of this sort were encountered, as the training and validation data are kept far out of this range,
 though if this model were to be extended to be used on other stocks, the risks and mitigations would need to be reassessed.
 
-The training and validation split was chosen to be 85% and 15% respectively.
-The two are separated such that the training set is chronologically first, and the validation set last.
-Notably absent here is a test split of the data.
-This was omitted as the model's generative nature makes it difficult to be optimised by the researcher to match the validation set in particular.
-I.e., multiple varied completions of the training set can be generated, none of which are expected to "converge" on the validation set.
+The training-validation-test split was chosen to be 70%, 15% and 15% respectively.
+The two are separated such that the training set is chronologically first, the validation set second and the test set last.
 
 ## Investigation of the Open Research Dilemma
 
@@ -126,8 +141,14 @@ I.e., multiple varied completions of the training set can be generated, none of 
 
 Despite introducing a KL loss term to TimeGAN, target KL loss of 0.1 was not able to be achieved.
 
-* TimeGAN KL loss of log returns: 0.75.
-* Baseline LSTM KL loss of log returns: 0.88.
+* TimeGAN mid-price return KL (50 bins): 1.201405 nats (validation); 1.045288 nats (test).
+* TimeGAN spread KL (50 bins): 1.412363 nats (validation); 2.612912 nats (test).
+* Baseline LSTM mid-price return KL (50 bins): 0.785493 nats (validation); 0.874616 nats (test).
+* Baseline LSTM spread KL (50 bins): 0.097118 nats (validation); 0.270768 nats (test).
+* Mean depth-profile SSIM: 0.929437 (validation); 0.865365 (test).
+* Absolute log-return lag-1 autocorrelation: 0.261066 (training); 0.809915 (generated validation); 0.809918 (generated test).
+* Structural violation rates: 0.0000% for all reported categories on validation, test, and generated books.
+  (This is due to the careful feature-space engineering outlined above, so that these mistakes are impossible to make.)
 
 Due to a strong mode of zero in the dataset, getting KL divergence to be reduced posed challenges.
 For instance, the baseline model predicted a distribution of the next data point which was gaussian.
@@ -140,12 +161,13 @@ TimeGAN resources:
 * Training VRAM: 4GiB.
 * Total model parameters: 1,859,113.
 * Training time (on Nvidia RTX 5070 GPU): ~950s.
+* CPU generation (40,462 events; 512-event warm-up): validation 0.977s (0.024 ms/event; 41,428 events/s); test 0.872s (0.022 ms/event; 46,399.3 events/s).
 
 Compared to baseline, stacked LSTM resources:
 
 * Training VRAM: < 1.5GiB.
 * Parameters: 229,456.
-* Training time: ~90s.
+* Training time (on Nvidia RTX 5070 GPU): ~51s.
 
 ### Engineering Recommendation and Trade-Offs
 

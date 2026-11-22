@@ -5,6 +5,7 @@ import torch
 from dataset import LOBSTERLevel10Dataset, load_dfs
 
 WARMUP_SIZE = 512
+NUM_SAMPLES = 3
 
 
 def kl_divergence(validation_values, predicted_values, bins: int = 50) -> float:
@@ -12,8 +13,9 @@ def kl_divergence(validation_values, predicted_values, bins: int = 50) -> float:
     actual, predicted = (np.asarray(x, dtype=float).ravel() for x in (validation_values, predicted_values))
     if any(x.size == 0 or not np.isfinite(x).all() for x in (actual, predicted)):
         raise ValueError("Samples must be nonempty and finite.")
-    edges = np.histogram_bin_edges(np.concatenate((actual, predicted)), bins=bins)
-    # Shared bins retain both tails; a small pseudocount avoids zero probabilities.
+    edges = np.histogram_bin_edges(actual, bins=bins)
+    edges[[0, -1]] = (-np.inf, np.inf)
+    # Reference-only bins are stable across models; overflow bins retain generated tails.
     p, q = (np.histogram(x, bins=edges)[0].astype(float) + 1e-8 for x in (actual, predicted))
     p, q = p / p.sum(), q / q.sum()
     return float(np.sum(p * np.log(p / q)))
@@ -104,8 +106,6 @@ if __name__ == "__main__":
     model = torch.load("timegan.pth", map_location="cpu", weights_only=False).eval()
 
     books, _ = load_dfs()
-    midpoint = 0.5 * (books["ASKp1"].to_numpy() + books["BIDp1"].to_numpy())
-    training_returns = np.diff(np.log(midpoint))[:len(training_data)]
     transition_count = len(books) - 1
     train_end = round(training_data._train_ratio * transition_count)
     validation_end = round((training_data._train_ratio + training_data._VALIDATION_RATIO) * transition_count)
@@ -113,49 +113,53 @@ if __name__ == "__main__":
     for name, evaluation_data in split_data.items():
         warmup_data = training_data if name == "validation" else validation_data
         actual = evaluation_data.data[:, 0].numpy()
-        context = warmup_data.data[-WARMUP_SIZE:].to(next(model.parameters())).unsqueeze(0)
+        context = warmup_data.data[-WARMUP_SIZE:].to(next(model.parameters())).unsqueeze(0).expand(NUM_SAMPLES, -1, -1)
         warmup = context.size(1)
 
         torch.manual_seed(0)
         generation_start = time.perf_counter()
         with torch.inference_mode():
-            noise = torch.randn(1, warmup + len(actual), model._latent_dims,
+            noise = torch.randn(NUM_SAMPLES, warmup + len(actual), model._latent_dims,
                                 dtype=context.dtype, device=context.device)
             synthetic = model.generator(noise)[:, warmup:]
             latent = model.supervisor(torch.cat((model.encode(context), synthetic), dim=1))
-            predictions[name] = model.decode(latent)[:, warmup:][0].double().cpu().numpy()
+            predictions[name] = model.decode(latent)[:, warmup:].double().cpu().numpy()
         generation_times[name] = time.perf_counter() - generation_start
         warmups[name] = warmup
 
     evaluation_data = split_data[split_name]
     predicted = predictions[split_name]
     generation_seconds, warmup = generation_times[split_name], warmups[split_name]
-    actual = evaluation_data.data[:, 0].numpy()
+    actual = evaluation_data.data[:, 0].numpy() * evaluation_data.std[0].item() + evaluation_data.mean[0].item()
     begin, end = (validation_end, transition_count) if args.test else (train_end, validation_end)
     actual_books = books.iloc[begin + 1:end + 1]
 
     actual_asks, actual_bids, actual_ask_sizes, actual_bid_sizes = book_arrays(actual_books)
     initial_midpoint = 0.5 * (books["ASKp1"].iloc[begin] + books["BIDp1"].iloc[begin])
-    predicted_book = reconstruct_book(predicted, evaluation_data.mean.numpy(), evaluation_data.std.numpy(), initial_midpoint)
+    predicted_books = [reconstruct_book(sample, evaluation_data.mean.numpy(), evaluation_data.std.numpy(), initial_midpoint)
+                       for sample in predicted]
+    predicted_book = tuple(np.concatenate([book[index] for book in predicted_books], axis=0) for index in range(4))
 
     actual_spread = actual_books["ASKp1"].to_numpy() - actual_books["BIDp1"].to_numpy()
     physical_predicted = predicted * evaluation_data.std.numpy() + evaluation_data.mean.numpy()
-    predicted_spread = np.exp(np.clip(physical_predicted[:, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
+    predicted_spread = np.exp(np.clip(physical_predicted[:, :, 1], np.log(1e-8), np.log(np.finfo(float).max) - 1))
     actual_depth = np.stack((actual_ask_sizes.mean(axis=0), actual_bid_sizes.mean(axis=0)))
     predicted_depth = np.stack((predicted_book[2].mean(axis=0), predicted_book[3].mean(axis=0)))
 
     print(f"Evaluating {split_name}: {len(actual)} events; warm-up: {'validation' if args.test else 'training'} ({warmup} events)")
-    print(f"Generation latency (including warm-up): {generation_seconds:.3f}s; "
-          f"{1_000 * generation_seconds / len(predicted):.3f} ms/event; "
-          f"throughput {len(predicted) / generation_seconds:.1f} events/s")
-    print(f"Training |return| lag-1 autocorrelation: {absolute_return_autocorrelation(training_returns):.6f}")
-    for name in ("validation", "test"):
-        raw_predicted_returns = (predictions[name][:, 0] * split_data[name].std[0].item()
-                                 + split_data[name].mean[0].item())
-        print(f"Predicted {name} |return| lag-1 autocorrelation: "
-              f"{absolute_return_autocorrelation(raw_predicted_returns):.6f}")
-    print(f"Mid-price return KL({split_name} || predicted): {kl_divergence(actual, predicted[:, 0]):.6f} nats (50 bins)")
-    print(f"Spread KL({split_name} || predicted): {kl_divergence(actual_spread, predicted_spread):.6f} nats (50 bins)")
+    generated_events = predicted.shape[0] * predicted.shape[1]
+    print(f"CPU generation latency for {predicted.shape[0]} paths (including warm-up): {generation_seconds:.3f}s; "
+          f"{1_000 * generation_seconds / generated_events:.3f} ms/event; "
+          f"throughput {generated_events / generation_seconds:.1f} events/s")
+    print(f"Actual {split_name} |return| lag-1 autocorrelation: {absolute_return_autocorrelation(actual):.6f}")
+    generated_autocorrelations = [
+        absolute_return_autocorrelation(sample[:, 0] * evaluation_data.std[0].item() + evaluation_data.mean[0].item())
+        for sample in predicted
+    ]
+    print(f"Generated {split_name} |return| lag-1 autocorrelation (mean of {len(predicted)} paths): "
+          f"{np.mean(generated_autocorrelations):.6f}")
+    print(f"Mid-price return KL({split_name} || predicted): {kl_divergence(actual, physical_predicted[:, :, 0]):.6f} nats (50 reference bins)")
+    print(f"Spread KL({split_name} || predicted): {kl_divergence(actual_spread, predicted_spread):.6f} nats (50 reference bins)")
     print(f"Mean depth-profile SSIM: {depth_ssim(actual_depth, predicted_depth):.6f}")
     for name, sample in ((split_name.title(), (actual_asks, actual_bids, actual_ask_sizes, actual_bid_sizes)),
                          ("Generated", predicted_book)):

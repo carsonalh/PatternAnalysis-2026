@@ -8,17 +8,16 @@ from torch.utils.data import Dataset
 from collections.abc import Sequence
 from typing import Final, Literal
 import numpy as np
+from constants import ORDER_BOOK_LEVELS
 
 logger = logging.getLogger(__name__)
 
 
 _ZIP_URL = "https://php.lobsterdata.com/info/sample/LOBSTER_SampleFile_AMZN_2012-06-21_10.zip"
 _ZIP_FILENAME = "LOBSTER_SampleFile_AMZN_2012-06-21_10.zip" 
-_ORDER_BOOK_LEVELS = 10
-FEATURE_DIMS = 4 * _ORDER_BOOK_LEVELS
 ORDER_BOOK_COLUMNS = tuple(
     f"{side}{field}{level}"
-    for level in range(1, _ORDER_BOOK_LEVELS + 1)
+    for level in range(1, ORDER_BOOK_LEVELS + 1)
     for side, field in (("ASK", "p"), ("ASK", "s"), ("BID", "p"), ("BID", "s"))
 )
 _MESSAGE_BOOK_COLUMN_NAMES = ("time" , "type" , "order_id" , "size" , "price" , "trade_direction")
